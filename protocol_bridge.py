@@ -1,16 +1,16 @@
 import serial
 
 from DS5.ds5_reader import JoystickSnapshot
-from Sensor.imu_reader import ImuSnapshot
 
 
 DEFAULT_TEENSY_PORT = "COM8"
+DEFAULT_BAUDRATE = 115200
 
 
 class ProtocolBridge:
     # 这层只负责“Controller 和 Teensy 之间怎么传”，
     # 不关心手柄和 IMU 各自是怎么读出来的。
-    def __init__(self, port: str = DEFAULT_TEENSY_PORT, baudrate: int = 115200):
+    def __init__(self, port: str = DEFAULT_TEENSY_PORT, baudrate: int = DEFAULT_BAUDRATE):
         self.serial = serial.Serial(port, baudrate, timeout=0.001)
         self.sequence = 0
         self._read_buffer = ""
@@ -18,16 +18,14 @@ class ProtocolBridge:
     def send_line(self, line: str) -> None:
         self.serial.write((line + "\n").encode("utf-8"))
 
-    def send_packet(self, joystick: JoystickSnapshot, imu: ImuSnapshot) -> int:
+    def send_packet(self, joystick: JoystickSnapshot) -> int:
         self.sequence += 1
-        self.send_line(self.build_packet_line(self.sequence, joystick, imu))
+        self.send_line(self.build_packet_line(self.sequence, joystick))
         return self.sequence
 
     @staticmethod
-    def build_packet_line(
-        sequence: int, joystick: JoystickSnapshot, imu: ImuSnapshot
-    ) -> str:
-        # 当前先固定使用文本总包，优点是联调直观、容易看串口数据。
+    def build_packet_line(sequence: int, joystick: JoystickSnapshot) -> str:
+        # 当前临时协议只服务于 DS5 手动控制链路，因此先压成最小手柄总包。
         return (
             "PKT "
             f"{sequence} "
@@ -37,15 +35,7 @@ class ProtocolBridge:
             f"{joystick.ry:.3f} "
             f"{joystick.l2:.3f} "
             f"{joystick.r2:.3f} "
-            f"{joystick.buttons} "
-            f"{1 if imu.valid else 0} "
-            f"{imu.roll:.3f} "
-            f"{imu.pitch:.3f} "
-            f"{imu.yaw:.3f} "
-            f"{imu.gx:.3f} "
-            f"{imu.gy:.3f} "
-            f"{imu.gz:.3f} "
-            f"{imu.timestamp_ms}"
+            f"{joystick.buttons}"
         )
 
     def read_available_lines(self) -> list[str]:
