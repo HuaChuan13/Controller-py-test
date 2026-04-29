@@ -4,15 +4,14 @@ import pygame
 
 
 DEFAULT_DEADZONE = 0.08
-HAT_UP_BIT = 11
-HAT_DOWN_BIT = 12
-HAT_LEFT_BIT = 13
-HAT_RIGHT_BIT = 14
+DPAD_UP_BIT = 11
+DPAD_DOWN_BIT = 12
+DPAD_LEFT_BIT = 13
+DPAD_RIGHT_BIT = 14
 
 
 @dataclass
 class JoystickSnapshot:
-    # 统一保存当前一帧 DS5 输入，后续桥接和控制映射都只依赖这份结构化数据。
     lx: float = 0.0
     ly: float = 0.0
     rx: float = 0.0
@@ -39,13 +38,13 @@ def buttons_bitmask(js: pygame.joystick.Joystick) -> int:
     if js.get_numhats() > 0:
         hat_x, hat_y = js.get_hat(0)
         if hat_y > 0:
-            mask |= 1 << HAT_UP_BIT
+            mask |= 1 << DPAD_UP_BIT
         if hat_y < 0:
-            mask |= 1 << HAT_DOWN_BIT
+            mask |= 1 << DPAD_DOWN_BIT
         if hat_x < 0:
-            mask |= 1 << HAT_LEFT_BIT
+            mask |= 1 << DPAD_LEFT_BIT
         if hat_x > 0:
-            mask |= 1 << HAT_RIGHT_BIT
+            mask |= 1 << DPAD_RIGHT_BIT
     return mask
 
 
@@ -56,7 +55,6 @@ class Ds5Reader:
         self.joystick: pygame.joystick.Joystick | None = None
 
     def open(self) -> str:
-        # 这里统一完成 pygame 和手柄初始化，避免入口脚本分散处理底层细节。
         pygame.init()
         pygame.joystick.init()
 
@@ -73,8 +71,6 @@ class Ds5Reader:
 
         pygame.event.pump()
 
-        # 当前按 Windows 下 DS5 的轴顺序读取。
-        # 如果后续换手柄或驱动，这里是主要调整点。
         lx = self.joystick.get_axis(0) if self.joystick.get_numaxes() > 0 else 0.0
         ly = self.joystick.get_axis(1) if self.joystick.get_numaxes() > 1 else 0.0
         rx = self.joystick.get_axis(2) if self.joystick.get_numaxes() > 2 else 0.0
@@ -82,12 +78,9 @@ class Ds5Reader:
         l2 = self.joystick.get_axis(4) if self.joystick.get_numaxes() > 4 else -1.0
         r2 = self.joystick.get_axis(5) if self.joystick.get_numaxes() > 5 else -1.0
 
-        # 前推为正，当前把纵向摇杆统一做一次方向修正。
         ly = -ly
         ry = -ry
 
-        # 读取阶段就完成死区、限幅和扳机归一化，
-        # 后续模块直接使用标准化后的控制量。
         return JoystickSnapshot(
             lx=clamp(apply_deadzone(lx, self.deadzone), -1.0, 1.0),
             ly=clamp(apply_deadzone(ly, self.deadzone), -1.0, 1.0),
@@ -99,6 +92,5 @@ class Ds5Reader:
         )
 
     def close(self) -> None:
-        # Controller 结束时显式关闭 pygame，避免下次启动残留状态。
         pygame.joystick.quit()
         pygame.quit()
