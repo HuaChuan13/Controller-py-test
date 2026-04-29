@@ -1,4 +1,6 @@
 import argparse
+import os
+import sys
 import time
 from typing import TextIO
 
@@ -10,6 +12,11 @@ from ds5_reader import DEFAULT_DEADZONE, Ds5Reader, JoystickSnapshot
 DEFAULT_TEENSY_PORT = "COM8"
 DEFAULT_BAUDRATE = 115200
 DEFAULT_SEND_HZ = 50
+DEFAULT_RENDER_HZ = 10
+DISPLAY_TAGS = {
+    "normal": ["CTRL", "SYS"],
+    "debug": ["CTRL", "SYS", "DS5", "MIX", "PWM"],
+}
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
@@ -19,6 +26,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--teensy-port", default=DEFAULT_TEENSY_PORT)
     parser.add_argument("--baudrate", type=int, default=DEFAULT_BAUDRATE)
     parser.add_argument("--send-hz", type=float, default=DEFAULT_SEND_HZ)
+    parser.add_argument("--render-hz", type=float, default=DEFAULT_RENDER_HZ)
     parser.add_argument("--deadzone", type=float, default=DEFAULT_DEADZONE)
     parser.add_argument("--view", choices=["normal", "debug"], default="normal")
     parser.add_argument("--log-file", default="")
@@ -59,22 +67,28 @@ def read_available_lines(
     return lines, read_buffer
 
 
-def should_display_teensy_line(line: str, view_mode: str) -> bool:
-    # 默认模式只保留最关键的控制摘要和系统状态，方便盯主链。
-    if view_mode == "debug":
-        return True
+def enable_ansi_console() -> None:
+    if os.name != "nt":
+        return
 
-    if line.startswith("CTRL{") or line.startswith("SYS{"):
-        return True
+    import ctypes
 
-    if line.startswith("MIX{") or line.startswith("PWM{") or line.startswith("DS5{"):
-        return False
-
-    return True
+    handle = ctypes.windll.kernel32.GetStdHandle(-11)
+    mode = ctypes.c_uint()
+    if ctypes.windll.kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+        ctypes.windll.kernel32.SetConsoleMode(handle, mode.value | 0x0004)
 
 
-def emit_teensy_lines(
-    lines: list[str], view_mode: str, log_file: TextIO | None
+def extract_tag(line: str) -> str | None:
+    brace_index = line.find("{")
+    if brace_index <= 0:
+        return None
+
+    return line[:brace_index]
+
+
+def update_panel_state(
+    lines: list[str], panel_state: dict[str, str], log_file: TextIO | None
 ) -> None:
     for line in lines:
         text = f"[Teensy] {line}"
@@ -82,12 +96,40 @@ def emit_teensy_lines(
             log_file.write(text + "\n")
             log_file.flush()
 
-        if should_display_teensy_line(line, view_mode):
-            print(text)
+        tag = extract_tag(line)
+        if tag is not None:
+            panel_state[tag] = line
+        else:
+            panel_state["INFO"] = line
+
+
+def build_panel_lines(
+    panel_state: dict[str, str], view_mode: str, send_hz: float, render_hz: float
+) -> list[str]:
+    lines = [
+        f"DS5 -> Teensy demo | view={view_mode} | send={send_hz:.0f}Hz | render={render_hz:.0f}Hz",
+        "-" * 72,
+    ]
+
+    for tag in DISPLAY_TAGS[view_mode]:
+        lines.append(panel_state.get(tag, f"{tag}{{waiting}}"))
+
+    if view_mode == "debug" and "INFO" in panel_state:
+        lines.append(panel_state["INFO"])
+
+    return lines
+
+
+def render_panel(lines: list[str]) -> None:
+    sys.stdout.write("\x1b[2J\x1b[H")
+    sys.stdout.write("\n".join(lines) + "\n")
+    sys.stdout.flush()
 
 
 def main() -> int:
     args = build_argument_parser().parse_args()
+
+    enable_ansi_console()
 
     ds5_reader = Ds5Reader(deadzone=args.deadzone)
     serial_port = None
@@ -95,6 +137,8 @@ def main() -> int:
     sequence = 0
     read_buffer = ""
     last_send = 0.0
+    last_render = 0.0
+    panel_state: dict[str, str] = {}
 
     try:
         joystick_name = ds5_reader.open()
@@ -108,7 +152,7 @@ def main() -> int:
             now = time.time()
 
             lines, read_buffer = read_available_lines(serial_port, read_buffer)
-            emit_teensy_lines(lines, args.view, log_file)
+            update_panel_state(lines, panel_state, log_file)
 
             joystick_snapshot = ds5_reader.read()
 
@@ -120,6 +164,14 @@ def main() -> int:
                     )
                 )
                 last_send = now
+
+            if now - last_render >= 1.0 / args.render_hz:
+                render_panel(
+                    build_panel_lines(
+                        panel_state, args.view, args.send_hz, args.render_hz
+                    )
+                )
+                last_render = now
 
             time.sleep(0.001)
     except RuntimeError as exc:
