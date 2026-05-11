@@ -1,5 +1,7 @@
 import argparse
+import json
 import os
+import socket
 import sys
 import time
 from typing import TextIO
@@ -16,6 +18,8 @@ from ds5_reader import (
 
 
 DEFAULT_TEENSY_PORT = "COM8"
+DEFAULT_GATEWAY_HOST = "192.168.10.2"
+DEFAULT_GATEWAY_PORT = 14550
 DEFAULT_BAUDRATE = 115200
 DEFAULT_SEND_HZ = 50  # 手柄信息发送频率
 DEFAULT_RENDER_HZ = 50  # 界面刷新频率
@@ -27,10 +31,13 @@ DISPLAY_TAGS = {
 
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Read DS5 input, send PKT to Teensy, and print Teensy telemetry"
+        description="Read DS5 input and send control packets to Teensy or rov_gateway"
     )
+    parser.add_argument("--mode", choices=["serial", "gateway"], default="serial")
     parser.add_argument("--teensy-port", default=DEFAULT_TEENSY_PORT)
     parser.add_argument("--baudrate", type=int, default=DEFAULT_BAUDRATE)
+    parser.add_argument("--gateway-host", default=DEFAULT_GATEWAY_HOST)
+    parser.add_argument("--gateway-port", type=int, default=DEFAULT_GATEWAY_PORT)
     parser.add_argument("--send-hz", type=float, default=DEFAULT_SEND_HZ)
     parser.add_argument("--render-hz", type=float, default=DEFAULT_RENDER_HZ)
     parser.add_argument("--deadzone", type=float, default=DEFAULT_DEADZONE)
@@ -65,6 +72,21 @@ def build_packet_line(sequence: int, joystick: JoystickSnapshot) -> str:
     )
 
 
+def build_control_message(sequence: int, joystick: JoystickSnapshot) -> dict[str, object]:
+    return {
+        "type": "control",
+        "seq": sequence,
+        "timestamp_ms": int(time.time() * 1000),
+        "lx": joystick.lx,
+        "ly": joystick.ly,
+        "rx": joystick.rx,
+        "ry": joystick.ry,
+        "l2": joystick.l2,
+        "r2": joystick.r2,
+        "buttons": joystick.buttons,
+    }
+
+
 def read_available_lines(
     serial_port: serial.Serial, read_buffer: str
 ) -> tuple[list[str], str]:
@@ -82,6 +104,59 @@ def read_available_lines(
             lines.append(stripped)
 
     return lines, read_buffer
+
+
+def build_gateway_status_line(message: dict[str, object]) -> str:
+    counts = message.get("counts")
+    if not isinstance(counts, dict):
+        counts = {}
+
+    return (
+        "GATEWAY{"
+        f"pc_alive={message.get('pc_alive')} "
+        f"teensy_connected={message.get('teensy_connected')} "
+        f"teensy_port={message.get('teensy_port')} "
+        f"pc_age_ms={message.get('pc_last_rx_age_ms')} "
+        f"udp_rx={counts.get('udp_rx')} "
+        f"teensy_tx={counts.get('teensy_tx')} "
+        f"teensy_rx={counts.get('teensy_rx')}"
+        "}"
+    )
+
+
+def decode_gateway_telemetry(data: bytes) -> list[str]:
+    message = json.loads(data.decode("utf-8"))
+    if not isinstance(message, dict):
+        raise ValueError("telemetry JSON root is not an object")
+    if message.get("type") != "telemetry":
+        raise ValueError(f"unsupported telemetry type: {message.get('type')!r}")
+
+    lines = [build_gateway_status_line(message)]
+    latest = message.get("latest")
+    if isinstance(latest, dict):
+        for value in latest.values():
+            if isinstance(value, str):
+                lines.append(value)
+
+    return lines
+
+
+def read_available_gateway_lines(udp_socket: socket.socket) -> list[str]:
+    lines: list[str] = []
+    while True:
+        try:
+            data, _ = udp_socket.recvfrom(65535)
+        except BlockingIOError:
+            break
+        except socket.timeout:
+            break
+
+        try:
+            lines.extend(decode_gateway_telemetry(data))
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
+            lines.append(f"INFO{{gateway_telemetry_error={exc}}}")
+
+    return lines
 
 
 def enable_ansi_console() -> None:
@@ -121,15 +196,22 @@ def update_panel_state(
 
 
 def build_panel_lines(
-    panel_state: dict[str, str], view_mode: str, send_hz: float, render_hz: float
+    panel_state: dict[str, str],
+    view_mode: str,
+    send_hz: float,
+    render_hz: float,
+    title: str = "DS5 -> Teensy demo",
 ) -> list[str]:
     lines = [
-        f"DS5 -> Teensy demo | view={view_mode} | send={send_hz:.0f}Hz | render={render_hz:.0f}Hz",
+        f"{title} | view={view_mode} | send={send_hz:.0f}Hz | render={render_hz:.0f}Hz",
         "-" * 72,
     ]
 
     for tag in DISPLAY_TAGS[view_mode]:
         lines.append(panel_state.get(tag, f"{tag}{{waiting}}"))
+
+    if "GATEWAY" in panel_state:
+        lines.append(panel_state["GATEWAY"])
 
     if view_mode == "debug" and "INFO" in panel_state:
         lines.append(panel_state["INFO"])
@@ -234,23 +316,12 @@ def run_ds5_debug(args: argparse.Namespace) -> int:
         ds5_reader.close()
 
 
-def main() -> int:
-    args = build_argument_parser().parse_args()
-
-    if args.sdl_joystick_device:
-        os.environ["SDL_JOYSTICK_DEVICE"] = args.sdl_joystick_device
-
-    enable_ansi_console()
-
-    if args.ds5_debug:
-        return run_ds5_debug(args)
-
-    ds5_reader = Ds5Reader(
-        deadzone=args.deadzone,
-        joystick_index=args.joystick_index,
-    )
-    serial_port = None
-    log_file = open(args.log_file, "a", encoding="utf-8") if args.log_file else None
+def run_serial_demo(
+    args: argparse.Namespace,
+    ds5_reader: Ds5Reader,
+    log_file: TextIO | None,
+) -> int:
+    serial_port: serial.Serial | None = None
     sequence = 0
     read_buffer = ""
     last_send = 0.0
@@ -285,7 +356,11 @@ def main() -> int:
             if now - last_render >= 1.0 / args.render_hz:
                 render_panel(
                     build_panel_lines(
-                        panel_state, args.view, args.send_hz, args.render_hz
+                        panel_state,
+                        args.view,
+                        args.send_hz,
+                        args.render_hz,
+                        title="DS5 -> Teensy demo",
                     )
                 )
                 last_render = now
@@ -300,6 +375,86 @@ def main() -> int:
     finally:
         if serial_port is not None:
             serial_port.close()
+
+
+def run_gateway_demo(
+    args: argparse.Namespace,
+    ds5_reader: Ds5Reader,
+    log_file: TextIO | None,
+) -> int:
+    target = (args.gateway_host, args.gateway_port)
+    sequence = 0
+    last_send = 0.0
+    last_render = 0.0
+    panel_state: dict[str, str] = {}
+
+    try:
+        joystick_name = ds5_reader.open()
+        print(f"Joystick: {joystick_name}")
+        print(f"Connecting rov_gateway on {args.gateway_host}:{args.gateway_port}...")
+
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp_socket:
+            udp_socket.setblocking(False)
+
+            while True:
+                now = time.time()
+
+                lines = read_available_gateway_lines(udp_socket)
+                update_panel_state(lines, panel_state, log_file)
+
+                joystick_snapshot = ds5_reader.read()
+
+                if now - last_send >= 1.0 / args.send_hz:
+                    sequence += 1
+                    payload = build_control_message(sequence, joystick_snapshot)
+                    encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+                    udp_socket.sendto(encoded, target)
+                    last_send = now
+
+                if now - last_render >= 1.0 / args.render_hz:
+                    render_panel(
+                        build_panel_lines(
+                            panel_state,
+                            args.view,
+                            args.send_hz,
+                            args.render_hz,
+                            title="DS5 -> rov_gateway demo",
+                        )
+                    )
+                    last_render = now
+
+                time.sleep(0.001)
+    except RuntimeError as exc:
+        print(exc)
+        return 1
+    except KeyboardInterrupt:
+        print("\nStop DS5 gateway demo")
+        return 0
+
+
+def main() -> int:
+    args = build_argument_parser().parse_args()
+
+    if args.sdl_joystick_device:
+        os.environ["SDL_JOYSTICK_DEVICE"] = args.sdl_joystick_device
+
+    enable_ansi_console()
+
+    if args.ds5_debug:
+        return run_ds5_debug(args)
+
+    ds5_reader = Ds5Reader(
+        deadzone=args.deadzone,
+        joystick_index=args.joystick_index,
+    )
+    log_file = open(args.log_file, "a", encoding="utf-8") if args.log_file else None
+
+    try:
+        if args.mode == "gateway":
+            return run_gateway_demo(args, ds5_reader, log_file)
+
+        return run_serial_demo(args, ds5_reader, log_file)
+    finally:
         if log_file is not None:
             log_file.close()
         ds5_reader.close()
