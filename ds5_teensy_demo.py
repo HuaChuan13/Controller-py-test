@@ -11,8 +11,8 @@ from ds5_reader import DEFAULT_DEADZONE, Ds5Reader, JoystickSnapshot
 
 DEFAULT_TEENSY_PORT = "COM8"
 DEFAULT_BAUDRATE = 115200
-DEFAULT_SEND_HZ = 50
-DEFAULT_RENDER_HZ = 10
+DEFAULT_SEND_HZ = 50  # 手柄信息发送频率
+DEFAULT_RENDER_HZ = 50  # 界面刷新频率
 DISPLAY_TAGS = {
     "normal": ["CTRL", "SYS"],
     "debug": ["CTRL", "SYS", "DS5", "MIX", "PWM"],
