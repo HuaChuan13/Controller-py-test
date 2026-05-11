@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import re
 import socket
 import sys
 import time
@@ -106,16 +107,35 @@ def read_available_lines(
     return lines, read_buffer
 
 
+def format_teensy_port(port: object) -> object:
+    if not isinstance(port, str) or not port:
+        return port
+    if port == "dry-run":
+        return port
+
+    normalized = port.replace("\\", "/")
+    basename = normalized.rsplit("/", 1)[-1]
+    serial_match = re.search(r"(\d{6,})", basename)
+    if "Teensy" in basename and serial_match is not None:
+        return f"Teensy:{serial_match.group(1)}"
+    if basename.startswith(("ttyACM", "ttyUSB", "COM")):
+        return basename
+    if len(basename) <= 24:
+        return basename
+    return f"...{basename[-20:]}"
+
+
 def build_gateway_status_line(message: dict[str, object]) -> str:
     counts = message.get("counts")
     if not isinstance(counts, dict):
         counts = {}
+    teensy_port = format_teensy_port(message.get("teensy_port"))
 
     return (
         "GATEWAY{"
         f"pc_alive={message.get('pc_alive')} "
         f"teensy_connected={message.get('teensy_connected')} "
-        f"teensy_port={message.get('teensy_port')} "
+        f"teensy={teensy_port} "
         f"pc_age_ms={message.get('pc_last_rx_age_ms')} "
         f"udp_rx={counts.get('udp_rx')} "
         f"teensy_tx={counts.get('teensy_tx')} "
