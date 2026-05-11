@@ -6,7 +6,13 @@ from typing import TextIO
 
 import serial
 
-from ds5_reader import DEFAULT_DEADZONE, Ds5Reader, JoystickSnapshot
+from ds5_reader import (
+    DEFAULT_DEADZONE,
+    Ds5Reader,
+    JoystickInfo,
+    JoystickRawSnapshot,
+    JoystickSnapshot,
+)
 
 
 DEFAULT_TEENSY_PORT = "COM8"
@@ -28,6 +34,17 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--send-hz", type=float, default=DEFAULT_SEND_HZ)
     parser.add_argument("--render-hz", type=float, default=DEFAULT_RENDER_HZ)
     parser.add_argument("--deadzone", type=float, default=DEFAULT_DEADZONE)
+    parser.add_argument("--joystick-index", type=int, default=0)
+    parser.add_argument(
+        "--sdl-joystick-device",
+        default="",
+        help="Linux SDL joystick device override, for example /dev/input/js0",
+    )
+    parser.add_argument(
+        "--ds5-debug",
+        action="store_true",
+        help="Only show raw DS5 axes/buttons/hats and packed snapshot; no serial",
+    )
     parser.add_argument("--view", choices=["normal", "debug"], default="normal")
     parser.add_argument("--log-file", default="")
     return parser
@@ -126,12 +143,112 @@ def render_panel(lines: list[str]) -> None:
     sys.stdout.flush()
 
 
+def format_pressed_buttons(raw: JoystickRawSnapshot) -> str:
+    pressed = [
+        f"{index}(bit={1 << index})"
+        for index, value in enumerate(raw.buttons[:32])
+        if value
+    ]
+    return ", ".join(pressed) if pressed else "none"
+
+
+def format_axis_values(raw: JoystickRawSnapshot) -> str:
+    if not raw.axes:
+        return "none"
+    return " ".join(f"{index}:{value:+.3f}" for index, value in enumerate(raw.axes))
+
+
+def format_button_values(raw: JoystickRawSnapshot) -> str:
+    if not raw.buttons:
+        return "none"
+    return " ".join(f"{index}:{value}" for index, value in enumerate(raw.buttons))
+
+
+def format_hat_values(raw: JoystickRawSnapshot) -> str:
+    if not raw.hats:
+        return "none"
+    return " ".join(
+        f"{index}:({hat_x:+d},{hat_y:+d})"
+        for index, (hat_x, hat_y) in enumerate(raw.hats)
+    )
+
+
+def build_ds5_debug_lines(
+    info: JoystickInfo,
+    raw: JoystickRawSnapshot,
+    snapshot: JoystickSnapshot,
+    joystick_index: int,
+    deadzone: float,
+) -> list[str]:
+    sdl_device = os.environ.get("SDL_JOYSTICK_DEVICE", "<unset>")
+    return [
+        f"DS5 mapping debug | joystick={joystick_index} | deadzone={deadzone:.2f}",
+        f"name={info.name}",
+        f"guid={info.guid}",
+        f"counts axes={info.axes} buttons={info.buttons} hats={info.hats}",
+        f"SDL_JOYSTICK_DEVICE={sdl_device}",
+        "-" * 72,
+        "Press one control at a time. Ctrl+C to stop.",
+        f"axes: {format_axis_values(raw)}",
+        f"buttons: {format_button_values(raw)}",
+        f"pressed: {format_pressed_buttons(raw)}",
+        f"hats: {format_hat_values(raw)}",
+        (
+            "packed: "
+            f"lx={snapshot.lx:+.3f} ly={snapshot.ly:+.3f} "
+            f"rx={snapshot.rx:+.3f} ry={snapshot.ry:+.3f} "
+            f"l2={snapshot.l2:.3f} r2={snapshot.r2:.3f} "
+            f"buttons={snapshot.buttons}"
+        ),
+    ]
+
+
+def run_ds5_debug(args: argparse.Namespace) -> int:
+    ds5_reader = Ds5Reader(
+        deadzone=args.deadzone,
+        joystick_index=args.joystick_index,
+    )
+    try:
+        ds5_reader.open()
+        info = ds5_reader.info()
+        while True:
+            raw = ds5_reader.read_raw()
+            snapshot = ds5_reader.read()
+            render_panel(
+                build_ds5_debug_lines(
+                    info,
+                    raw,
+                    snapshot,
+                    args.joystick_index,
+                    args.deadzone,
+                )
+            )
+            time.sleep(1.0 / args.render_hz)
+    except RuntimeError as exc:
+        print(exc)
+        return 1
+    except KeyboardInterrupt:
+        print("\nStop DS5 debug")
+        return 0
+    finally:
+        ds5_reader.close()
+
+
 def main() -> int:
     args = build_argument_parser().parse_args()
 
+    if args.sdl_joystick_device:
+        os.environ["SDL_JOYSTICK_DEVICE"] = args.sdl_joystick_device
+
     enable_ansi_console()
 
-    ds5_reader = Ds5Reader(deadzone=args.deadzone)
+    if args.ds5_debug:
+        return run_ds5_debug(args)
+
+    ds5_reader = Ds5Reader(
+        deadzone=args.deadzone,
+        joystick_index=args.joystick_index,
+    )
     serial_port = None
     log_file = open(args.log_file, "a", encoding="utf-8") if args.log_file else None
     sequence = 0

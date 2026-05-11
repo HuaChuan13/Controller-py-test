@@ -98,6 +98,29 @@ uv run python ds5_teensy_demo.py --teensy-port /dev/ttyACM0 --view debug
 
 当前远端实测输出包含 `CTRL{}`、`SYS{}`、`DS5{}`、`MIX{}`、`PWM{}`，说明 `DS5 -> Controller -> PKT -> Teensy` 链路已跑通。
 
+### DS5 映射自检
+
+映射自检只读取手柄，不打开串口：
+
+```bash
+cd ~/Code/controller
+eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+
+uv run python ds5_teensy_demo.py \
+  --ds5-debug \
+  --sdl-joystick-device /dev/input/js0
+```
+
+自检面板会显示：
+
+- `axes`：每个轴的 raw 值
+- `buttons`：每个 button index 的 raw 值
+- `pressed`：当前按下的 button index 和对应 bit 值
+- `hats`：十字键 hat 值
+- `packed`：当前 `ds5_reader.py` 打包后的 `JoystickSnapshot`
+
+现场验证时每次只按一个控制量，重点记录十字键、面键、`L3`、`R3`、`L2`、`R2` 对应的 raw 变化。
+
 ### Linux 权限与输入设备
 
 串口权限当前正常，`nvidia` 用户已在 `dialout` 组。若换机器后串口打不开，可检查：

@@ -1,3 +1,4 @@
+import os
 from dataclasses import dataclass
 
 import pygame
@@ -19,6 +20,22 @@ class JoystickSnapshot:
     l2: float = 0.0
     r2: float = 0.0
     buttons: int = 0
+
+
+@dataclass
+class JoystickInfo:
+    name: str
+    guid: str
+    axes: int
+    buttons: int
+    hats: int
+
+
+@dataclass
+class JoystickRawSnapshot:
+    axes: tuple[float, ...]
+    buttons: tuple[int, ...]
+    hats: tuple[tuple[int, int], ...]
 
 
 def clamp(value: float, low: float, high: float) -> float:
@@ -48,6 +65,17 @@ def buttons_bitmask(js: pygame.joystick.Joystick) -> int:
     return mask
 
 
+def build_open_error(joystick_index: int, joystick_count: int) -> str:
+    message = f"未检测到 DS5 手柄: requested index={joystick_index}, count={joystick_count}"
+    if os.name == "posix":
+        message += (
+            "\nLinux 提示: 如果系统能看到 /dev/input/js0，但 pygame count=0，"
+            "可以先设置 SDL_JOYSTICK_DEVICE=/dev/input/js0；"
+            "长期方案是处理 /dev/input/event* 的 input 组或 udev 权限。"
+        )
+    return message
+
+
 class Ds5Reader:
     def __init__(self, deadzone: float = DEFAULT_DEADZONE, joystick_index: int = 0):
         self.deadzone = deadzone
@@ -58,12 +86,45 @@ class Ds5Reader:
         pygame.init()
         pygame.joystick.init()
 
-        if pygame.joystick.get_count() <= self.joystick_index:
-            raise RuntimeError("未检测到 DS5 手柄")
+        joystick_count = pygame.joystick.get_count()
+        if joystick_count <= self.joystick_index:
+            raise RuntimeError(build_open_error(self.joystick_index, joystick_count))
 
         self.joystick = pygame.joystick.Joystick(self.joystick_index)
         self.joystick.init()
         return self.joystick.get_name()
+
+    def info(self) -> JoystickInfo:
+        if self.joystick is None:
+            raise RuntimeError("DS5 reader has not been opened")
+
+        return JoystickInfo(
+            name=self.joystick.get_name(),
+            guid=self.joystick.get_guid(),
+            axes=self.joystick.get_numaxes(),
+            buttons=self.joystick.get_numbuttons(),
+            hats=self.joystick.get_numhats(),
+        )
+
+    def read_raw(self) -> JoystickRawSnapshot:
+        if self.joystick is None:
+            raise RuntimeError("DS5 reader has not been opened")
+
+        pygame.event.pump()
+        return JoystickRawSnapshot(
+            axes=tuple(
+                self.joystick.get_axis(index)
+                for index in range(self.joystick.get_numaxes())
+            ),
+            buttons=tuple(
+                self.joystick.get_button(index)
+                for index in range(self.joystick.get_numbuttons())
+            ),
+            hats=tuple(
+                self.joystick.get_hat(index)
+                for index in range(self.joystick.get_numhats())
+            ),
+        )
 
     def read(self) -> JoystickSnapshot:
         if self.joystick is None:
