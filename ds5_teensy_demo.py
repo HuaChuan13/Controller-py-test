@@ -394,6 +394,9 @@ def run_gateway_demo(
         print(f"Connecting rov_gateway on {args.gateway_host}:{args.gateway_port}...")
 
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp_socket:
+            # Windows 上未绑定的 UDP socket 不能先 recvfrom；绑定 0 表示让系统分配本地临时端口。
+            # rov_gateway 会把 telemetry 回发到这个源端口。
+            udp_socket.bind(("", 0))
             udp_socket.setblocking(False)
 
             while True:
