@@ -1,9 +1,11 @@
 import argparse
 import json
 import os
+import queue
 import re
 import socket
 import sys
+import threading
 import time
 from typing import TextIO
 
@@ -24,6 +26,8 @@ DEFAULT_GATEWAY_PORT = 14550
 DEFAULT_BAUDRATE = 115200
 DEFAULT_SEND_HZ = 50  # 手柄信息发送频率
 DEFAULT_RENDER_HZ = 50  # 界面刷新频率
+DEFAULT_SERIAL_OPEN_TIMEOUT_S = 3.0
+DEFAULT_SERIAL_WRITE_TIMEOUT_S = 0.5
 DISPLAY_TAGS = {
     "normal": ["CTRL", "SYS"],
     "debug": ["CTRL", "SYS", "DS5", "MIX", "PWM"],
@@ -37,6 +41,16 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mode", choices=["serial", "gateway"], default="serial")
     parser.add_argument("--teensy-port", default=DEFAULT_TEENSY_PORT)
     parser.add_argument("--baudrate", type=int, default=DEFAULT_BAUDRATE)
+    parser.add_argument(
+        "--serial-open-timeout",
+        type=float,
+        default=DEFAULT_SERIAL_OPEN_TIMEOUT_S,
+    )
+    parser.add_argument(
+        "--serial-write-timeout",
+        type=float,
+        default=DEFAULT_SERIAL_WRITE_TIMEOUT_S,
+    )
     parser.add_argument("--gateway-host", default=DEFAULT_GATEWAY_HOST)
     parser.add_argument("--gateway-port", type=int, default=DEFAULT_GATEWAY_PORT)
     parser.add_argument("--send-hz", type=float, default=DEFAULT_SEND_HZ)
@@ -105,6 +119,52 @@ def read_available_lines(
             lines.append(stripped)
 
     return lines, read_buffer
+
+
+def open_serial_port(
+    port: str,
+    baudrate: int,
+    read_timeout: float,
+    write_timeout: float,
+    open_timeout: float,
+) -> serial.Serial:
+    result_queue: queue.Queue[tuple[str, object]] = queue.Queue(maxsize=1)
+
+    def worker() -> None:
+        try:
+            serial_port = serial.Serial(
+                port,
+                baudrate,
+                timeout=read_timeout,
+                write_timeout=write_timeout,
+            )
+        except Exception as exc:
+            result_queue.put(("error", exc))
+            return
+
+        result_queue.put(("ok", serial_port))
+
+    thread = threading.Thread(target=worker, name="serial-open", daemon=True)
+    thread.start()
+    deadline = time.monotonic() + max(0.1, open_timeout)
+
+    while True:
+        try:
+            status, payload = result_queue.get(timeout=0.05)
+        except queue.Empty:
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"Opening serial {port} timed out after {open_timeout:.1f}s"
+                )
+            continue
+
+        if status == "ok":
+            return payload  # type: ignore[return-value]
+
+        if isinstance(payload, Exception):
+            raise RuntimeError(f"Failed to open serial {port}: {payload}") from payload
+
+        raise RuntimeError(f"Failed to open serial {port}: {payload}")
 
 
 def format_teensy_port(port: object) -> object:
@@ -352,7 +412,14 @@ def run_serial_demo(
         joystick_name = ds5_reader.open()
         print(f"Joystick: {joystick_name}")
 
-        serial_port = serial.Serial(args.teensy_port, args.baudrate, timeout=0.001)
+        print(f"Opening Teensy serial {args.teensy_port}...", flush=True)
+        serial_port = open_serial_port(
+            args.teensy_port,
+            args.baudrate,
+            read_timeout=0.001,
+            write_timeout=args.serial_write_timeout,
+            open_timeout=args.serial_open_timeout,
+        )
         print(f"Connecting Teensy on {args.teensy_port}, wait for board ready...")
         time.sleep(2.0)
 
@@ -366,11 +433,16 @@ def run_serial_demo(
 
             if now - last_send >= 1.0 / args.send_hz:
                 sequence += 1
-                serial_port.write(
-                    (build_packet_line(sequence, joystick_snapshot) + "\n").encode(
-                        "utf-8"
+                try:
+                    serial_port.write(
+                        (build_packet_line(sequence, joystick_snapshot) + "\n").encode(
+                            "utf-8"
+                        )
                     )
-                )
+                except serial.SerialTimeoutException as exc:
+                    raise RuntimeError(
+                        f"Serial write to {args.teensy_port} timed out"
+                    ) from exc
                 last_send = now
 
             if now - last_render >= 1.0 / args.render_hz:
@@ -386,7 +458,7 @@ def run_serial_demo(
                 last_render = now
 
             time.sleep(0.001)
-    except RuntimeError as exc:
+    except (RuntimeError, serial.SerialException) as exc:
         print(exc)
         return 1
     except KeyboardInterrupt:
