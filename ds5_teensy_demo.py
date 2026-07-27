@@ -30,7 +30,7 @@ DEFAULT_SERIAL_OPEN_TIMEOUT_S = 3.0
 DEFAULT_SERIAL_WRITE_TIMEOUT_S = 0.5
 DISPLAY_TAGS = {
     "normal": ["CTRL", "SYS"],
-    "debug": ["CTRL", "SYS", "DS5", "MIX", "PWM"],
+    "debug": ["CTRL", "SYS", "DS5", "MIX", "PWM", "DEPTH"],
 }
 
 
