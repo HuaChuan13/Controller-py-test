@@ -28,10 +28,17 @@ DEFAULT_SEND_HZ = 50  # 手柄信息发送频率
 DEFAULT_RENDER_HZ = 50  # 界面刷新频率
 DEFAULT_SERIAL_OPEN_TIMEOUT_S = 3.0
 DEFAULT_SERIAL_WRITE_TIMEOUT_S = 0.5
-DISPLAY_TAGS = {
-    "normal": ["CTRL", "SYS"],
-    "debug": ["CTRL", "SYS", "DS5", "MIX", "PWM", "DEPTH", "IMU"],
-}
+DISPLAY_TAGS = [
+    "CTRL",
+    "SYS",
+    "DS5",
+    "MIX",
+    "PWM",
+    "SHT40",
+    "PM08",
+    "DEPTH",
+    "IMU",
+]
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
@@ -67,7 +74,6 @@ def build_argument_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Only show raw DS5 axes/buttons/hats and packed snapshot; no serial",
     )
-    parser.add_argument("--view", choices=["normal", "debug"], default="normal")
     parser.add_argument("--log-file", default="")
     return parser
 
@@ -87,7 +93,9 @@ def build_packet_line(sequence: int, joystick: JoystickSnapshot) -> str:
     )
 
 
-def build_control_message(sequence: int, joystick: JoystickSnapshot) -> dict[str, object]:
+def build_control_message(
+    sequence: int, joystick: JoystickSnapshot
+) -> dict[str, object]:
     return {
         "type": "control",
         "seq": sequence,
@@ -277,23 +285,22 @@ def update_panel_state(
 
 def build_panel_lines(
     panel_state: dict[str, str],
-    view_mode: str,
     send_hz: float,
     render_hz: float,
     title: str = "DS5 -> Teensy demo",
 ) -> list[str]:
     lines = [
-        f"{title} | view={view_mode} | send={send_hz:.0f}Hz | render={render_hz:.0f}Hz",
+        f"{title} | send={send_hz:.0f}Hz | render={render_hz:.0f}Hz",
         "-" * 72,
     ]
 
-    for tag in DISPLAY_TAGS[view_mode]:
+    for tag in DISPLAY_TAGS:
         lines.append(panel_state.get(tag, f"{tag}{{waiting}}"))
 
     if "GATEWAY" in panel_state:
         lines.append(panel_state["GATEWAY"])
 
-    if view_mode == "debug" and "INFO" in panel_state:
+    if "INFO" in panel_state:
         lines.append(panel_state["INFO"])
 
     return lines
@@ -449,7 +456,6 @@ def run_serial_demo(
                 render_panel(
                     build_panel_lines(
                         panel_state,
-                        args.view,
                         args.send_hz,
                         args.render_hz,
                         title="DS5 -> Teensy demo",
@@ -510,7 +516,6 @@ def run_gateway_demo(
                     render_panel(
                         build_panel_lines(
                             panel_state,
-                            args.view,
                             args.send_hz,
                             args.render_hz,
                             title="DS5 -> rov_gateway demo",
@@ -549,6 +554,7 @@ def main() -> int:
             return run_gateway_demo(args, ds5_reader, log_file)
 
         return run_serial_demo(args, ds5_reader, log_file)
+
     finally:
         if log_file is not None:
             log_file.close()
