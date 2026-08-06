@@ -1,8 +1,8 @@
 # ROV Controller 项目交接
 
-> 最近源码核对：2026-08-04
+> 最近源码核对：2026-08-06
 >
-> 行为基线：`53acaff Simplify controller telemetry display`
+> 通信基线：串口与 Gateway 模式共用同一套 `PKT`/标签文本
 
 本文只记录当前可用状态，不记录逐次开发流水。行为变化时直接修改对应章节，历史过程以 Git 为准。
 
@@ -22,7 +22,7 @@
 DS5 -> Controller -> USB/PKT -> Teensy
 
 三层联调：
-DS5 -> Controller -> UDP/JSON :14550 -> Jetson rov_gateway
+DS5 -> Controller -> UDP/PKT :14550 -> Jetson rov_gateway
      -> USB/PKT -> Teensy
 ```
 
@@ -34,7 +34,7 @@ DS5 -> Controller -> UDP/JSON :14550 -> Jetson rov_gateway
 
 - Windows/Linux DS5 读取、摇杆死区、扳机归一化和按键位图。
 - `serial` 模式：通过 USB 串口发送 Teensy `PKT`。
-- `gateway` 模式：通过 UDP 发送控制 JSON，并接收 telemetry JSON。
+- `gateway` 模式：通过 UDP 直接发送 `PKT`，并接收逐行回传的 Teensy 标签。
 - 单一完整状态面板，不再提供普通/调试视图切换。
 - `--ds5-debug` 原始轴、按键、十字键和打包结果检查。
 - 可配置控制发送频率、面板刷新频率、串口和 Gateway 地址。
@@ -52,7 +52,7 @@ Gateway 模式额外显示 `GATEWAY`；无标签信息使用 `INFO` 显示。
 ### 已有实机结论
 
 - Windows 串口直连链路可用于 Teensy 控制和传感器回显。
-- Gateway UDP 模式已完成 Windows 绑定本地临时端口的兼容处理。
+- Gateway UDP 模式使用 Windows 本地临时端口，并按最后一个合法来源接收回传。
 - Jetson 上曾使用 Homebrew Python 3.13、`/dev/input/js0` 和 Teensy 稳定设备路径完成链路测试。
 - Controller 的串口打开或写入超时曾由 Teensy 的 PM08/CAN 路径失去响应触发；上位机超时通常是下位机或 USB 状态的症状，不代表控制数值超限。
 
@@ -67,8 +67,8 @@ Gateway 模式额外显示 `GATEWAY`；无标签信息使用 `INFO` 显示。
 - 正式产品 UI、任务控制、参数配置和数据可视化。
 - 串口掉线后的自动重连。
 - 多 Gateway 控制端仲裁。
-- 自动化单元测试和集成测试。
-- 对持续串口或 UDP 输入洪泛的显式处理预算。
+- 带真实 Gateway、Teensy 和 DS5 的自动化集成测试。
+- 对持续串口输入洪泛的显式处理预算；Gateway UDP 每轮已限制为 32 个数据报。
 
 ## 3. 代码结构
 
@@ -79,6 +79,7 @@ Controller/
 ├─ README.md
 ├─ ds5_reader.py
 ├─ ds5_teensy_demo.py
+├─ test_ds5_teensy_demo.py
 ├─ pyproject.toml
 └─ uv.lock
 ```
@@ -87,6 +88,7 @@ Controller/
 | --- | --- |
 | `ds5_reader.py` | 初始化 pygame，读取 DS5，归一化轴和打包按钮 |
 | `ds5_teensy_demo.py` | 参数解析、串口/UDP 通信、状态缓存、固定面板和日志 |
+| `test_ds5_teensy_demo.py` | raw Gateway 文本行和接收预算的最小单元测试 |
 | `pyproject.toml` | Python 版本与直接依赖 |
 | `uv.lock` | 可复现依赖锁定 |
 
@@ -116,7 +118,7 @@ Controller/
 -> 到期时发送PKT -> 到期时重绘面板 -> sleep 1ms
 ```
 
-Gateway 循环结构相同，但使用非阻塞 UDP socket。Windows 上 socket 必须先绑定本地临时端口，Gateway 才能把 telemetry 回传到正确源端口。
+Gateway 循环结构相同，但使用非阻塞 UDP socket，每轮最多处理 32 个数据报。Windows 上 socket 必须先绑定本地临时端口，Gateway 才能把标签行回传到正确源端口。
 
 串口打开单独使用一个 daemon worker，是因为 Windows 驱动层的 `serial.Serial()` 曾无法及时响应 `Ctrl+C`。主线程每 50ms 检查结果并在 3 秒后返回错误。除这个打开保护外，不应为当前程序增加后台线程。
 
@@ -139,31 +141,15 @@ PKT <seq> <lx> <ly> <rx> <ry> <l2> <r2> <buttons>
 
 Teensy 回显通过 `TAG{...}` 的标签前缀进入最新值缓存。面板不解析标签内部字段，因此字段增减通常不需要修改 Controller。
 
-### Gateway 控制消息
+### Gateway raw UDP
 
-```json
-{
-  "type": "control",
-  "seq": 1,
-  "timestamp_ms": 0,
-  "lx": 0.0,
-  "ly": 0.0,
-  "rx": 0.0,
-  "ry": 0.0,
-  "l2": 0.0,
-  "r2": 0.0,
-  "buttons": 0
-}
-```
+- 目标为 `192.168.10.2:14550`；
+- 一个 UDP 数据报携带一条完整 ASCII 文本记录，不带 `\r` 或 `\n`；
+- Controller 直接发送和串口模式相同的 `PKT`；
+- Gateway 逐行回传 Teensy 标签，并低频生成 `GATEWAY{teensy_connected=... teensy_age_ms=...}`；
+- Controller 不解析标签内部业务字段，只按 `{` 前面的标签名缓存最新行。
 
-Controller 期待 Gateway 回包根对象满足：
-
-- `type` 为 `telemetry`；
-- `latest` 是标签到完整文本行的映射；
-- `counts` 提供 UDP 和 Teensy 收发计数；
-- `pc_alive`、`teensy_connected`、`teensy_port` 和 `pc_last_rx_age_ms` 用于 `GATEWAY{}`。
-
-Gateway 当前按最后一个合法 PC 地址回传 telemetry，因此 Python Controller 和 C# 上位机不能同时控制同一个 Gateway。
+Gateway 当前按最后一个合法 PC 地址回传文本，因此 Python Controller 和 C# 上位机不能同时控制同一个 Gateway。
 
 ## 6. 环境与命令
 
@@ -212,7 +198,8 @@ Homebrew 默认 Python 3.14 曾导致 `pygame==2.6.1` 尝试源码编译并缺�
 无硬件检查：
 
 ```powershell
-uv run python -m compileall -q ds5_reader.py ds5_teensy_demo.py
+uv run python -m unittest -q
+uv run python -m compileall -q ds5_reader.py ds5_teensy_demo.py test_ds5_teensy_demo.py
 uv run python ds5_teensy_demo.py --help
 ```
 
@@ -221,10 +208,10 @@ uv run python ds5_teensy_demo.py --help
 1. `--ds5-debug` 确认摇杆、扳机、十字键和按钮变化。
 2. 串口模式确认控制包持续发送且固定面板全部出现。
 3. 停止 Controller，确认 Teensy 按自身超时策略回到安全输出。
-4. Gateway 模式确认 `GATEWAY{}`、控制计数和所有传感器标签更新。
+4. Gateway 模式确认 `GATEWAY{}` 和所有传感器标签更新。
 5. 同一时间只运行一个串口占用者和一个 Gateway 控制端。
 
-当前没有自动化测试，命令行检查不能替代 DS5、Teensy 和 Gateway 实机验证。
+当前有 3 个 raw Gateway 协议单元测试；它们不能替代 DS5、Teensy 和 Gateway 实机验证。
 
 ## 8. 已知问题与排查
 
@@ -233,12 +220,12 @@ uv run python ds5_teensy_demo.py --help
 | 未检测到 DS5 | 手柄连接、`--joystick-index`、Linux `/dev/input` 权限和 SDL 设备 |
 | 打开 COM 超时 | 端口号、串口占用、USB 枚举、Teensy 主循环是否仍响应 |
 | 串口写入超时 | Teensy 是否被 CAN/I2C/串口传感器路径拖住，不先放大超时 |
-| 标签停在 `waiting` | Teensy 固件是否输出该标签、Gateway `latest` 是否包含该行 |
+| 标签停在 `waiting` | Teensy 固件是否输出该标签、Gateway 是否收到并回传该行 |
 | 数值停住但仍显示 | 面板保存最后值，必须结合 `SYS{}` 中对应 `alive` 判断新鲜度 |
 | Gateway 无回包 | Jetson 地址/端口、防火墙、Gateway 是否运行及 UDP 源端口绑定 |
 | Linux 扳机静止为 0.5 | SDL 轴初值或映射不同，先用 `--ds5-debug` 记录 raw 值 |
 
-当前串口读取会处理当时全部 `in_waiting` 数据，UDP 接收会排空当前队列。在正常 50Hz 链路下可用；若出现持续输入洪泛或主循环延迟，再增加明确的包数或时间预算，不提前搭建队列框架。
+当前串口读取会处理当时全部 `in_waiting` 数据；UDP 每轮最多接收 32 个数据报。若实测串口持续积压，再为串口路径增加明确预算，不提前搭建额外线程或队列框架。
 
 启用 `--log-file` 后每行都会写入并 flush，只用于短期诊断，不建议长期高频记录。
 

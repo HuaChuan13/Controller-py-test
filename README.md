@@ -9,7 +9,7 @@ ROV 的 Python 调试上位机，用于读取 DualSense 手柄、发送控制数
 DS5 -> Controller -> USB/PKT -> Teensy
 
 网关联调：
-DS5 -> Controller -> UDP/JSON -> Jetson rov_gateway -> USB/PKT -> Teensy
+DS5 -> Controller -> UDP/PKT -> Jetson rov_gateway -> USB/PKT -> Teensy
 ```
 
 ## 环境
@@ -54,7 +54,7 @@ uv run python ds5_teensy_demo.py --mode serial --teensy-port COM8 --render-hz 10
 uv run python ds5_teensy_demo.py --mode gateway --gateway-host 192.168.10.2 --gateway-port 14550
 ```
 
-Gateway 模式不打开 PC 上的 Teensy 串口。状态面板会额外显示 `GATEWAY{}`。
+Gateway 模式直接发送与串口模式相同的 `PKT` 文本，并接收 Gateway 原样转发的 Teensy 标签。它不打开 PC 上的 Teensy 串口，状态面板会额外显示 `GATEWAY{}`。
 
 同一时间不要让本程序和 C# 上位机同时控制同一个 Gateway。当前 Gateway 按最后一个合法 PC 地址回传数据，多客户端会互相抢占控制权。
 

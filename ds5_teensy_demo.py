@@ -1,8 +1,6 @@
 import argparse
-import json
 import os
 import queue
-import re
 import socket
 import sys
 import threading
@@ -28,10 +26,22 @@ DEFAULT_SEND_HZ = 50  # 手柄信息发送频率
 DEFAULT_RENDER_HZ = 50  # 界面刷新频率
 DEFAULT_SERIAL_OPEN_TIMEOUT_S = 3.0
 DEFAULT_SERIAL_WRITE_TIMEOUT_S = 0.5
+MAX_GATEWAY_DATAGRAMS_PER_LOOP = 32
+# DISPLAY_TAGS = [
+#     "CTRL",
+#     "SYS",
+#     "DS5",
+#     "MIX",
+#     "PWM",
+#     "SHT40",
+#     "PM08",
+#     "DEPTH",
+#     "IMU",
+# ]
 DISPLAY_TAGS = [
-    "CTRL",
     "SYS",
     "DS5",
+    "CTRL",
     "MIX",
     "PWM",
     "SHT40",
@@ -79,7 +89,6 @@ def build_argument_parser() -> argparse.ArgumentParser:
 
 
 def build_packet_line(sequence: int, joystick: JoystickSnapshot) -> str:
-    # 当前临时协议只服务于 DS5 手动控制 demo，因此只发送手柄总包。
     return (
         "PKT "
         f"{sequence} "
@@ -91,23 +100,6 @@ def build_packet_line(sequence: int, joystick: JoystickSnapshot) -> str:
         f"{joystick.r2:.3f} "
         f"{joystick.buttons}"
     )
-
-
-def build_control_message(
-    sequence: int, joystick: JoystickSnapshot
-) -> dict[str, object]:
-    return {
-        "type": "control",
-        "seq": sequence,
-        "timestamp_ms": int(time.time() * 1000),
-        "lx": joystick.lx,
-        "ly": joystick.ly,
-        "rx": joystick.rx,
-        "ry": joystick.ry,
-        "l2": joystick.l2,
-        "r2": joystick.r2,
-        "buttons": joystick.buttons,
-    }
 
 
 def read_available_lines(
@@ -175,74 +167,32 @@ def open_serial_port(
         raise RuntimeError(f"Failed to open serial {port}: {payload}")
 
 
-def format_teensy_port(port: object) -> object:
-    if not isinstance(port, str) or not port:
-        return port
-    if port == "dry-run":
-        return port
-
-    normalized = port.replace("\\", "/")
-    basename = normalized.rsplit("/", 1)[-1]
-    serial_match = re.search(r"(\d{6,})", basename)
-    if "Teensy" in basename and serial_match is not None:
-        return f"Teensy:{serial_match.group(1)}"
-    if basename.startswith(("ttyACM", "ttyUSB", "COM")):
-        return basename
-    if len(basename) <= 24:
-        return basename
-    return f"...{basename[-20:]}"
+def decode_gateway_line(data: bytes) -> str:
+    if not data or b"\r" in data or b"\n" in data:
+        raise ValueError("gateway datagram must contain one line")
+    line = data.decode("ascii").strip()
+    if not line:
+        raise ValueError("gateway datagram is empty")
+    return line
 
 
-def build_gateway_status_line(message: dict[str, object]) -> str:
-    counts = message.get("counts")
-    if not isinstance(counts, dict):
-        counts = {}
-    teensy_port = format_teensy_port(message.get("teensy_port"))
-
-    return (
-        "GATEWAY{"
-        f"pc_alive={message.get('pc_alive')} "
-        f"teensy_connected={message.get('teensy_connected')} "
-        f"teensy={teensy_port} "
-        f"pc_age_ms={message.get('pc_last_rx_age_ms')} "
-        f"udp_rx={counts.get('udp_rx')} "
-        f"teensy_tx={counts.get('teensy_tx')} "
-        f"teensy_rx={counts.get('teensy_rx')}"
-        "}"
-    )
-
-
-def decode_gateway_telemetry(data: bytes) -> list[str]:
-    message = json.loads(data.decode("utf-8"))
-    if not isinstance(message, dict):
-        raise ValueError("telemetry JSON root is not an object")
-    if message.get("type") != "telemetry":
-        raise ValueError(f"unsupported telemetry type: {message.get('type')!r}")
-
-    lines = [build_gateway_status_line(message)]
-    latest = message.get("latest")
-    if isinstance(latest, dict):
-        for value in latest.values():
-            if isinstance(value, str):
-                lines.append(value)
-
-    return lines
-
-
-def read_available_gateway_lines(udp_socket: socket.socket) -> list[str]:
+def read_available_gateway_lines(
+    udp_socket: socket.socket,
+    max_datagrams: int = MAX_GATEWAY_DATAGRAMS_PER_LOOP,
+) -> list[str]:
     lines: list[str] = []
-    while True:
+    for _ in range(max_datagrams):
         try:
-            data, _ = udp_socket.recvfrom(65535)
+            data, _ = udp_socket.recvfrom(4096)
         except BlockingIOError:
             break
         except socket.timeout:
             break
 
         try:
-            lines.extend(decode_gateway_telemetry(data))
-        except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
-            lines.append(f"INFO{{gateway_telemetry_error={exc}}}")
+            lines.append(decode_gateway_line(data))
+        except (UnicodeDecodeError, ValueError) as exc:
+            lines.append(f"INFO{{gateway_line_error={exc}}}")
 
     return lines
 
@@ -507,8 +457,7 @@ def run_gateway_demo(
 
                 if now - last_send >= 1.0 / args.send_hz:
                     sequence += 1
-                    payload = build_control_message(sequence, joystick_snapshot)
-                    encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+                    encoded = build_packet_line(sequence, joystick_snapshot).encode("ascii")
                     udp_socket.sendto(encoded, target)
                     last_send = now
 

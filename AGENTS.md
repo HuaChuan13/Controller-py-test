@@ -6,7 +6,7 @@
 - 修改前先读 `PROJECT_HANDOVER.md` 和 `README.md`。
 - 文档与源码冲突时，以当前源码和最近一次实机结果为准，并同步修正文档。
 - 先检查 `git status`，保留用户已有的未提交改动。
-- 修改 Teensy `PKT`、Gateway JSON、DS5 映射或控制频率前，先核对对应项目的当前协议。
+- 修改 Teensy `PKT`、Gateway raw UDP、DS5 映射或控制频率前，先核对对应项目的当前协议。
 
 ## 实现原则
 
@@ -21,7 +21,7 @@
 ## 通信与运行约束
 
 - 50Hz 控制发送循环不得被串口读取、UDP 接收、日志或界面刷新长期阻塞。
-- 串口读取使用短超时，UDP socket 保持非阻塞。
+- 串口读取使用短超时，UDP socket 保持非阻塞且每轮接收有数据报数量预算。
 - 保留 Windows 串口打开超时保护和串口写入超时保护。
 - 不通过单纯增大超时时间掩盖 Teensy、USB、CAN 或传感器路径卡死。
 - 不在高频循环加入大量逐包输出；状态面板只显示最新缓存。
@@ -34,7 +34,8 @@
 
 ```powershell
 cd D:\Code\ROV_code\Controller
-uv run python -m compileall -q ds5_reader.py ds5_teensy_demo.py
+uv run python -m unittest -q
+uv run python -m compileall -q ds5_reader.py ds5_teensy_demo.py test_ds5_teensy_demo.py
 uv run python ds5_teensy_demo.py --help
 ```
 
