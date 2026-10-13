@@ -34,13 +34,15 @@ uv sync
 uv run python ds5_teensy_demo.py --mode serial --teensy-port COM8
 ```
 
-`COM8` 需要按实际 Teensy 端口修改。面板固定显示：
+`COM8` 需要按实际 Teensy 端口修改。面板读取以下原始标签：
 
 ```text
 CTRL{} SYS{} DS5{} MIX{} PWM{} SHT40{} PM08{} DEPTH{} IMU{}
 ```
 
-面板数值使用固定列宽，IMU拆成温度、加速度（ACC）、角速度（GYR）、角度（ANG）四行，正负号和位数变化不会移动后面的列。这些分组只用于显示，回传协议和原始日志不变。
+显示改为统一三列网格，IMU拆成温度、加速度（ACC）、角速度（GYR）、角度（ANG）四行；MIX和PWM共用M1-M8表头。数值右对齐，正负号和位数变化不会移动其他字段。常规面板最多79字符宽、固定24行，终端可视区域至少80列、24行；Gateway和INFO各额外占一行。
+
+刷新时原位覆盖并清除行尾，不再每帧清空整屏。这些变化仅在Controller显示端，回传协议、原始日志、收发和刷新频率不变，无需重新烧录Teensy。
 
 降低面板刷新频率不会改变控制发送频率：
 
@@ -56,7 +58,7 @@ uv run python ds5_teensy_demo.py --mode serial --teensy-port COM8 --render-hz 10
 uv run python ds5_teensy_demo.py --mode gateway --gateway-host 192.168.10.2 --gateway-port 14550
 ```
 
-Gateway 模式直接发送与串口模式相同的 `PKT` 文本，并接收 Gateway 原样转发的 Teensy 标签。它不打开 PC 上的 Teensy 串口，状态面板会额外显示 `GATEWAY{}`。
+Gateway 模式直接发送与串口模式相同的 `PKT` 文本，并接收 Gateway 原样转发的 Teensy 标签。它不打开 PC 上的 Teensy 串口，状态面板会额外显示GATEWAY连接状态行。
 
 同一时间不要让本程序和 C# 上位机同时控制同一个 Gateway。当前 Gateway 按最后一个合法 PC 地址回传数据，多客户端会互相抢占控制权。
 

@@ -1,5 +1,6 @@
 import io
 import unittest
+from contextlib import redirect_stdout
 
 from ds5_teensy_demo import (
     FLOAT_PRECISION,
@@ -7,12 +8,27 @@ from ds5_teensy_demo import (
     build_packet_line,
     build_panel_lines,
     decode_gateway_line,
-    format_panel_lines,
     format_panel_value,
+    parse_panel_fields,
     read_available_gateway_lines,
+    render_panel,
     update_panel_state,
 )
 from ds5_reader import JoystickSnapshot
+
+
+# 截图中可见的数据；截图未提供的字段留空，不虚构读数。
+SCREENSHOT_STATE = {
+    "SYS": "SYS{uptime_ms=6644660 pkt_alive=1 sht40_alive=1 pm08_alive=0 depth_alive=0 imu_alive=1 pkt_seq=1640 pkt_age_ms=5 timeout_count=7}",
+    "DS5": "DS5{buttons=0 dpad=NONE lx=0 ly=0 rx=0 ry=-0.082 l2=0 r2=0}",
+    "CTRL": "CTRL{mode=STABILIZE action=IDLE surge=0 sway=0 heave=0 roll=0 pitch=0 yaw=-0.01}",
+    "MIX": "MIX{m1=0.01 m2=0.01 m3=0.01 m4=-0.01 m5=0 m6=0 m7=0 m8=0}",
+    "PWM": "PWM{limit=70% m1=1503 m2=1503 m3=1503 m4=1497 m5=1500 m6=1500 m7=1500 m8=1500}",
+    "SHT40": "SHT40{temp_c=26.07 humidity_rh=52.54}",
+    "PM08": "PM08{voltage_v=17.94 current_a=-0.18 power_w=-3.27 temp_c=31.60}",
+    "DEPTH": "DEPTH{depth_m=0 pressure_mbar=0 surface_mbar=1013 temp_c=0}",
+    "IMU": "IMU{temp_c=26 ax_mps2=-0.061 ay_mps2=0.038 az_mps2=9.783 gx_dps=0.003 gy_dps=-0.021 gz_dps=-0.029 roll_deg=0.38 pitch_deg=0.25 yaw_deg=0.84}",
+}
 
 
 class FakeSocket:
@@ -53,7 +69,7 @@ class PanelTests(unittest.TestCase):
         for value in ("0%", "50%", "100%"):
             self.assertEqual(len(format_panel_value("PWM", "limit", value)), 4)
         self.assertEqual(format_panel_value("PWM", "m1", "1500"), "1500")
-        self.assertEqual(format_panel_value("MIX", "m1", "-1"), "    -1.00")
+        self.assertEqual(format_panel_value("MIX", "m1", "-1"), "   -1.00")
 
     def test_imu_rows_keep_positions_even_without_data(self) -> None:
         frames = (
@@ -66,16 +82,18 @@ class PanelTests(unittest.TestCase):
             "pitch_deg=-90 yaw_deg=-179.99}",
             "IMU{temp_c=nan ax_mps2=invalid yaw_deg=1e30}",
         )
-        baseline = format_panel_lines("IMU", frames[0])
+        baseline = build_panel_lines({"IMU": frames[0]}, 50, 50)[-4:]
         for frame in frames:
-            rows = format_panel_lines("IMU", frame)
+            rows = build_panel_lines({"IMU": frame}, 50, 50)[-4:]
             self.assertEqual(len(rows), 4)
             for row, expected in zip(rows, baseline):
                 self.assertEqual(len(row), len(expected))
-                self.assertEqual(
-                    [index for index, char in enumerate(row) if char == "="],
-                    [index for index, char in enumerate(expected) if char == "="],
-                )
+            for row, labels in zip(rows[1:], (
+                ("ax m/s2", "ay m/s2", "az m/s2"),
+                ("gx deg/s", "gy deg/s", "gz deg/s"),
+                ("roll deg", "pitch deg", "yaw deg"),
+            )):
+                self.assertEqual([row.index(label) for label in labels], [8, 32, 56])
 
     def test_invalid_and_overflow_values_do_not_move_columns(self) -> None:
         for value, marker in ((None, "---"), ("nan", "ERR"), ("inf", "ERR"),
@@ -86,29 +104,45 @@ class PanelTests(unittest.TestCase):
         self.assertEqual(format_panel_value("SYS", "pkt_alive", "123"), "!")
         self.assertEqual(format_panel_value("SYS", "future_field", "original"), "original")
 
-    def test_variable_text_and_numbers_keep_next_field_position(self) -> None:
-        samples = {
-            "CTRL": ("mode=MANUAL action=IDLE yaw=0", "mode=STABILIZE action=FWD+CW yaw=-1"),
-            "DS5": ("buttons=0 dpad=NONE lx=0", "buttons=4294967295 dpad=DOWN_RIGHT lx=-1"),
-            "SYS": ("uptime_ms=0 stab_fault=NONE pkt_age_ms=1",
-                    "uptime_ms=4294967295 stab_fault=CONTROL_GAP pkt_age_ms=500"),
-            "MIX": ("m1=0 m2=1", "m1=-1 m2=-0.25"),
-            "PWM": ("limit=0% m1=1500", "limit=100% m1=1000"),
-            "SHT40": ("temp_c=0 humidity_rh=0", "temp_c=-20 humidity_rh=100"),
-            "PM08": ("voltage_v=0 current_a=0 power_w=0 temp_c=0",
-                     "voltage_v=24.59 current_a=-100 power_w=-2459 temp_c=32.85"),
-            "DEPTH": ("depth_m=0 pressure_mbar=0 surface_mbar=0 temp_c=0",
-                      "depth_m=-0.043 pressure_mbar=1008.8 surface_mbar=1013 temp_c=26.01"),
-            "GATEWAY": ("teensy_connected=1 teensy_age_ms=1",
-                        "teensy_connected=0 teensy_age_ms=-1"),
-        }
-        for tag, bodies in samples.items():
-            rows = [format_panel_lines(tag, f"{tag}{{{body}}}")[0] for body in bodies]
-            self.assertEqual(len(rows[0]), len(rows[1]))
-            self.assertEqual(
-                [index for index, char in enumerate(rows[0]) if char == "="],
-                [index for index, char in enumerate(rows[1]) if char == "="],
-            )
+    def test_panel_is_bounded_and_keeps_grid_and_motor_columns(self) -> None:
+        extreme = dict(SCREENSHOT_STATE)
+        extreme["SYS"] = "SYS{uptime_ms=4294967295 pkt_seq=4294967295 pkt_age_ms=500 timeout_count=4294967295 rx_rejected=4294967295 stab_fault=CONTROL_GAP}"
+        extreme["DS5"] = "DS5{buttons=4294967295 dpad=DOWN_RIGHT lx=-1 ly=1 rx=-1 ry=1 l2=1 r2=1}"
+        extreme["CTRL"] = "CTRL{mode=MANUAL action=FWD+BACK+LEFT+RIGHT+UP+DOWN+CW+CCW surge=-1 sway=1 heave=-1 roll=1 pitch=-1 yaw=1 yaw_sp=-179.99 rate_sp=-30}"
+        for state in ({}, SCREENSHOT_STATE, extreme):
+            rows = build_panel_lines(state, 50, 50)
+            self.assertEqual(len(rows), 24)
+            self.assertLessEqual(max(map(len, rows)), 79)
+            for index in (2, 3, 5, 6, 7, 9, 10, 11, 16, 18, 21, 22, 23):
+                self.assertEqual(len(rows[index]), 79)
+            for index in (12, 13, 14):
+                self.assertEqual(len(rows[index]), 79)
+                for motor in range(8):
+                    slot = rows[index][8 + 9 * motor:16 + 9 * motor].strip()
+                    self.assertTrue(slot)
+            self.assertEqual([rows[12].index(f"M{motor}") for motor in range(1, 9)],
+                             [14 + 9 * motor for motor in range(8)])
+            self.assertEqual(rows[2].index("pkt_seq"), 32)
+            self.assertEqual(rows[11].index("PWM limit"), 56)
+
+    def test_parser_and_renderer_keep_raw_data_and_clear_old_tail(self) -> None:
+        self.assertEqual(parse_panel_fields("IMU{temp_c=26 gx_dps=-0.021}"),
+                         {"temp_c": "26", "gx_dps": "-0.021"})
+        self.assertEqual(parse_panel_fields("IMU{partial"), {})
+        state = dict(SCREENSHOT_STATE)
+        state["INFO"] = "INFO{" + "x" * 200 + "}"
+        rows = build_panel_lines(state, 50, 50)
+        self.assertEqual(len(rows[-1]), 79)
+        self.assertTrue(rows[-1].endswith("..."))
+        output = io.StringIO()
+        with redirect_stdout(output):
+            render_panel(rows)
+        text = output.getvalue()
+        self.assertTrue(text.startswith("\x1b[H"))
+        self.assertTrue(text.endswith("\x1b[J"))
+        self.assertNotIn("\x1b[2J", text)
+        self.assertEqual(text.count("\x1b[K"), len(rows))
+        self.assertEqual(text.count("\n"), len(rows) - 1)
 
     def test_rendering_preserves_raw_cache_logs_packets_and_frequencies(self) -> None:
         raw = "IMU{temp_c=31.0 gx_dps=-0.01 yaw_deg=112.09}"
@@ -120,7 +154,7 @@ class PanelTests(unittest.TestCase):
         self.assertEqual(state, original)
         self.assertEqual(log.getvalue(), f"[Teensy] {raw}\n[Teensy] INFO{{unchanged}}\n")
         self.assertEqual(panel[-1], "INFO{unchanged}")
-        self.assertEqual(len(panel), 15)  # 标题2行、其他标签8行、IMU4行、INFO1行
+        self.assertEqual(len(panel), 25)  # 24行固定面板，另加INFO行
         self.assertEqual(build_packet_line(186, JoystickSnapshot(buttons=2048)),
                          "PKT 186 0.000 0.000 0.000 0.000 0.000 0.000 2048")
         args = build_argument_parser().parse_args([])
