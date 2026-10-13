@@ -1,4 +1,5 @@
 import argparse
+import math
 import os
 import queue
 import socket
@@ -49,6 +50,29 @@ DISPLAY_TAGS = [
     "DEPTH",
     "IMU",
 ]
+
+# 仅用于面板显示，不修改接收缓存或回传协议。
+FLOAT_PRECISION = dict.fromkeys(
+    ("surge", "sway", "heave", "roll", "pitch", "yaw", "yaw_sp", "rate_sp",
+     "temp_c", "humidity_rh", "voltage_v", "current_a", "power_w",
+     "pressure_mbar", "surface_mbar", "roll_deg", "pitch_deg", "yaw_deg"), 2
+) | dict.fromkeys(
+    ("lx", "ly", "rx", "ry", "l2", "r2", "depth_m",
+     "ax_mps2", "ay_mps2", "az_mps2", "gx_dps", "gy_dps", "gz_dps"), 3
+)
+TEXT_WIDTHS = {"mode": 9, "action": 34, "dpad": 10, "stab_fault": 11}
+INTEGER_WIDTHS = {
+    "uptime_ms": 10, "pkt_seq": 10, "pkt_age_ms": 5,
+    "timeout_count": 10, "rx_rejected": 10, "buttons": 10,
+    "ready": 1, "limit": 4, "teensy_connected": 1, "teensy_age_ms": 10,
+}
+MOTOR_FIELDS = tuple(f"m{index}" for index in range(1, 9))
+IMU_ROWS = (
+    ("IMU", ("temp_c",)),
+    ("ACC", ("ax_mps2", "ay_mps2", "az_mps2")),
+    ("GYR", ("gx_dps", "gy_dps", "gz_dps")),
+    ("ANG", ("roll_deg", "pitch_deg", "yaw_deg")),
+)
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
@@ -233,6 +257,61 @@ def update_panel_state(
             panel_state["INFO"] = line
 
 
+def format_panel_value(tag: str, key: str, value: str | None) -> str:
+    if key in TEXT_WIDTHS:
+        width = TEXT_WIDTHS[key]
+        text = value or "---"
+        return (text if len(text) <= width else "OVF").ljust(width)
+
+    precision = 2 if tag == "MIX" and key in MOTOR_FIELDS else FLOAT_PRECISION.get(key)
+    width = 9 if precision is not None else INTEGER_WIDTHS.get(key)
+    if key.endswith("_alive"):
+        width = 1
+    if tag == "PWM" and key in MOTOR_FIELDS:
+        width = 4
+    if width is None:
+        return value or "---"
+
+    text = "---"[:width]
+    if value:
+        try:
+            if precision is not None:
+                number = float(value)
+                text = f"{number:+.{precision}f}" if math.isfinite(number) else "ERR"
+            elif tag == "PWM" and key == "limit":
+                text = f"{int(value.removesuffix('%'))}%"
+            else:
+                text = str(int(value))
+        except ValueError:
+            text = "ERR"
+    if len(text) > width:
+        text = "OVF" if width >= 3 else "!" * width
+    return text.rjust(width)
+
+
+def format_panel_lines(tag: str, line: str) -> list[str]:
+    tokens = []
+    if line.startswith(f"{tag}{{") and line.endswith("}"):
+        tokens = [token.partition("=") for token in line[len(tag) + 1:-1].split()]
+
+    # IMU 无论是否已收到数据，都保持四行和固定字段位置。
+    if tag == "IMU":
+        fields = {key: value for key, separator, value in tokens if separator}
+        return [
+            f"{label}{{" + " ".join(
+                f"{key.split('_', 1)[0]}={format_panel_value(tag, key, fields.get(key))}"
+                for key in keys
+            ) + "}"
+            for label, keys in IMU_ROWS
+        ]
+    if not tokens:
+        return [line]
+    return [f"{tag}{{" + " ".join(
+        f"{key}={format_panel_value(tag, key, value)}" if separator else key
+        for key, separator, value in tokens
+    ) + "}"]
+
+
 def build_panel_lines(
     panel_state: dict[str, str],
     send_hz: float,
@@ -245,10 +324,10 @@ def build_panel_lines(
     ]
 
     for tag in DISPLAY_TAGS:
-        lines.append(panel_state.get(tag, f"{tag}{{waiting}}"))
+        lines.extend(format_panel_lines(tag, panel_state.get(tag, f"{tag}{{waiting}}")))
 
     if "GATEWAY" in panel_state:
-        lines.append(panel_state["GATEWAY"])
+        lines.extend(format_panel_lines("GATEWAY", panel_state["GATEWAY"]))
 
     if "INFO" in panel_state:
         lines.append(panel_state["INFO"])

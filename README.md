@@ -40,6 +40,8 @@ uv run python ds5_teensy_demo.py --mode serial --teensy-port COM8
 CTRL{} SYS{} DS5{} MIX{} PWM{} SHT40{} PM08{} DEPTH{} IMU{}
 ```
 
+面板数值使用固定列宽，IMU拆成温度、加速度（ACC）、角速度（GYR）、角度（ANG）四行，正负号和位数变化不会移动后面的列。这些分组只用于显示，回传协议和原始日志不变。
+
 降低面板刷新频率不会改变控制发送频率：
 
 ```powershell

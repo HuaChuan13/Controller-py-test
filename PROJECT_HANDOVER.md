@@ -1,6 +1,6 @@
 # ROV Controller 项目交接
 
-> 最近源码核对：2026-08-06
+> 最近源码核对：2026-10-13
 >
 > 通信基线：串口与 Gateway 模式共用同一套 `PKT`/标签文本
 
@@ -36,6 +36,7 @@ DS5 -> Controller -> UDP/PKT :14550 -> Jetson rov_gateway
 - `serial` 模式：通过 USB 串口发送 Teensy `PKT`。
 - `gateway` 模式：通过 UDP 直接发送 `PKT`，并接收逐行回传的 Teensy 标签。
 - 单一完整状态面板，不再提供普通/调试视图切换。
+- 固定数值列宽和正负号位置；IMU按温度、加速度、角速度、角度四行显示，缺失和异常值不挤动其他列。
 - `--ds5-debug` 原始轴、按键、十字键和打包结果检查。
 - 可配置控制发送频率、面板刷新频率、串口和 Gateway 地址。
 - 可选文本日志。
@@ -48,6 +49,12 @@ CTRL SYS DS5 MIX PWM SHT40 PM08 DEPTH IMU
 ```
 
 Gateway 模式额外显示 `GATEWAY`；无标签信息使用 `INFO` 显示。
+
+面板只在绘制时格式化原始标签缓存，串口/Gateway收发、PKT内容、原始日志和默认50Hz频率不变。ACC/GYR/ANG是IMU的屏幕分组，不是新增回传标签；无需重新烧录Teensy。
+
+已知浮点字段保留固件原有2/3位精度，以9字符槽右对齐并显示正负号。缺失数据为`---`，无效数值为`ERR`，超出列宽为`OVF`（1/2字符状态槽用`!`）。模式、动作和十字键名称也使用固定列宽，不截断成另一个有效值。IMU尚未收到数据时仍占四行。
+
+IMU面板固定显示当前10项字段；增加新IMU字段时需扩展IMU_ROWS和相应格式。其他标签未识别的字段继续原样显示，原始缓存和日志始终保留完整接收行。
 
 ### 已有实机结论
 
@@ -139,7 +146,7 @@ PKT <seq> <lx> <ly> <rx> <ry> <l2> <r2> <buttons>
 - 十字键固定使用 bit 11 至 bit 14；
 - 每行以换行符结束。
 
-Teensy 回显通过 `TAG{...}` 的标签前缀进入最新值缓存。面板不解析标签内部字段，因此字段增减通常不需要修改 Controller。
+Teensy回显通过TAG前缀进入最新原始行缓存。标签内部字段只在绘制时解析用于对齐，不参与控制判断；接收缓存和日志不补空格、不改数值。增加需要固定格式显示的字段时扩展面板字段规则。
 
 ### Gateway raw UDP
 
@@ -147,7 +154,7 @@ Teensy 回显通过 `TAG{...}` 的标签前缀进入最新值缓存。面板不�
 - 一个 UDP 数据报携带一条完整 ASCII 文本记录，不带 `\r` 或 `\n`；
 - Controller 直接发送和串口模式相同的 `PKT`；
 - Gateway 逐行回传 Teensy 标签，并低频生成 `GATEWAY{teensy_connected=... teensy_age_ms=...}`；
-- Controller 不解析标签内部业务字段，只按 `{` 前面的标签名缓存最新行。
+- Controller按`{`前面的标签名缓存最新原始行，字段只用于面板排版，不参与控制或网关路由。
 
 Gateway 当前按最后一个合法 PC 地址回传文本，因此 Python Controller 和 C# 上位机不能同时控制同一个 Gateway。
 
@@ -211,7 +218,7 @@ uv run python ds5_teensy_demo.py --help
 4. Gateway 模式确认 `GATEWAY{}` 和所有传感器标签更新。
 5. 同一时间只运行一个串口占用者和一个 Gateway 控制端。
 
-当前有 3 个 raw Gateway 协议单元测试；它们不能替代 DS5、Teensy 和 Gateway 实机验证。
+当前8项单元测试覆盖raw Gateway协议、列宽/精度/字段位置、IMU缺失/异常/超宽值、缓存与日志原样保留、PKT内容和默认频率。unittest、compileall、--help已通过；本机完整面板生成批次平均约0.05ms，不包含真实终端绘制、串口和UDP延迟，也不能替代实机验证。
 
 ## 8. 已知问题与排查
 
@@ -222,6 +229,7 @@ uv run python ds5_teensy_demo.py --help
 | 串口写入超时 | Teensy 是否被 CAN/I2C/串口传感器路径拖住，不先放大超时 |
 | 标签停在 `waiting` | Teensy 固件是否输出该标签、Gateway 是否收到并回传该行 |
 | 数值停住但仍显示 | 面板保存最后值，必须结合 `SYS{}` 中对应 `alive` 判断新鲜度 |
+| 数值显示为ERR/OVF/! | 无效数值或超出显示槽宽；查原始日志，不把占位符当成0 |
 | Gateway 无回包 | Jetson 地址/端口、防火墙、Gateway 是否运行及 UDP 源端口绑定 |
 | Linux 扳机静止为 0.5 | SDL 轴初值或映射不同，先用 `--ds5-debug` 记录 raw 值 |
 
@@ -235,7 +243,7 @@ uv run python ds5_teensy_demo.py --help
 
 1. 保持本仓库是可快速运行的调试工具，不复制 C# 上位机功能。
 2. 协议变更时同步核对 Teensy、Gateway 和 C# 项目。
-3. 新增传感器标签只扩展固定标签列表，不解析无业务需要的字段。
+3. 新增标签扩展固定标签列表；需要对齐时扩展显示格式，不把显示解析用于控制或协议转换。
 4. 完成 Linux DS5 映射确认和最新 Gateway 全标签联调。
 5. 始终区分静态检查、软件联调和实机验证。
 6. 使用英文 commit message，并保持一次提交只处理一类修改。
