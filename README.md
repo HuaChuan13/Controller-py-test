@@ -40,6 +40,8 @@ uv run python ds5_teensy_demo.py --mode serial --teensy-port COM8
 CTRL{} SYS{} DS5{} MIX{} PWM{} SHT40{} PM08{} DEPTH{} IMU{}
 ```
 
+只有IMU在显示端拆成温度、加速度（ACC）、角速度（GYR）、角度（ANG）四行，三轴数值使用固定列宽；其余标签保持原始文本。ACC/GYR/ANG不是新增回传标签，原始日志和50Hz频率不变，无需重新烧录Teensy。
+
 降低面板刷新频率不会改变控制发送频率：
 
 ```powershell

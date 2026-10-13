@@ -1,4 +1,5 @@
 import argparse
+import math
 import os
 import queue
 import socket
@@ -49,6 +50,12 @@ DISPLAY_TAGS = [
     "DEPTH",
     "IMU",
 ]
+IMU_ROWS = (
+    ("IMU", ("temp_c",), 2),
+    ("ACC", ("ax_mps2", "ay_mps2", "az_mps2"), 3),
+    ("GYR", ("gx_dps", "gy_dps", "gz_dps"), 3),
+    ("ANG", ("roll_deg", "pitch_deg", "yaw_deg"), 2),
+)
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
@@ -233,6 +240,30 @@ def update_panel_state(
             panel_state["INFO"] = line
 
 
+def format_imu_lines(line: str) -> list[str]:
+    # 仅排版IMU，接收缓存和日志保持原样。
+    fields = {}
+    if line.startswith("IMU{") and line.endswith("}"):
+        fields = dict(token.split("=", 1) for token in line[4:-1].split() if "=" in token)
+
+    def cell(key: str, precision: int) -> str:
+        text = "---"
+        if key in fields:
+            try:
+                number = float(fields[key])
+                text = f"{number:+.{precision}f}" if math.isfinite(number) else "ERR"
+            except ValueError:
+                text = "ERR"
+        if len(text) > 9:
+            text = "OVF"
+        return f"{key:<9}={text:>9}"
+
+    return [
+        f"{label}{{" + " ".join(cell(key, precision) for key in keys) + "}"
+        for label, keys, precision in IMU_ROWS
+    ]
+
+
 def build_panel_lines(
     panel_state: dict[str, str],
     send_hz: float,
@@ -245,7 +276,11 @@ def build_panel_lines(
     ]
 
     for tag in DISPLAY_TAGS:
-        lines.append(panel_state.get(tag, f"{tag}{{waiting}}"))
+        line = panel_state.get(tag, f"{tag}{{waiting}}")
+        if tag == "IMU":
+            lines.extend(format_imu_lines(line))
+        else:
+            lines.append(line)
 
     if "GATEWAY" in panel_state:
         lines.append(panel_state["GATEWAY"])

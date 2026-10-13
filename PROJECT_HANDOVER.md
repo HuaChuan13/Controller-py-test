@@ -1,6 +1,6 @@
 # ROV Controller 项目交接
 
-> 最近源码核对：2026-08-06
+> 最近源码核对：2026-10-13
 >
 > 通信基线：串口与 Gateway 模式共用同一套 `PKT`/标签文本
 
@@ -36,6 +36,7 @@ DS5 -> Controller -> UDP/PKT :14550 -> Jetson rov_gateway
 - `serial` 模式：通过 USB 串口发送 Teensy `PKT`。
 - `gateway` 模式：通过 UDP 直接发送 `PKT`，并接收逐行回传的 Teensy 标签。
 - 单一完整状态面板，不再提供普通/调试视图切换。
+- 仅IMU显示拆为温度、加速度（ACC）、角速度（GYR）、角度（ANG）四行并固定列宽，其余标签保持原始文本。
 - `--ds5-debug` 原始轴、按键、十字键和打包结果检查。
 - 可配置控制发送频率、面板刷新频率、串口和 Gateway 地址。
 - 可选文本日志。
@@ -48,6 +49,10 @@ CTRL SYS DS5 MIX PWM SHT40 PM08 DEPTH IMU
 ```
 
 Gateway 模式额外显示 `GATEWAY`；无标签信息使用 `INFO` 显示。
+
+UI开发在`ui-optimization`分支进行。IMU仅在绘制时解析，温度/角度保留2位小数，加速度/角速度保留3位小数；每个数值占9字符，缺失为`---`、无效为`ERR`、超宽为`OVF`。三轴行固定64字符，未收到IMU时也保留四行占位。
+
+ACC/GYR/ANG只是显示分组，固件仍只回传IMU标签。缓存、日志、收发、默认50Hz频率及其余标签的布局均不变，不修改Teensy固件。新增IMU字段需更新`IMU_ROWS`；其他标签继续原样显示完整字段。
 
 ### 已有实机结论
 
@@ -211,7 +216,7 @@ uv run python ds5_teensy_demo.py --help
 4. Gateway 模式确认 `GATEWAY{}` 和所有传感器标签更新。
 5. 同一时间只运行一个串口占用者和一个 Gateway 控制端。
 
-当前有 3 个 raw Gateway 协议单元测试；它们不能替代 DS5、Teensy 和 Gateway 实机验证。
+当前5项单元测试覆盖raw Gateway协议、仅IMU排版、固定列宽以及缓存和日志原样保留；unittest、compileall和--help通过。已用用户截图数据生成并查看终端预览，未进行新的DS5、Teensy或Gateway实机验证。
 
 ## 8. 已知问题与排查
 
