@@ -1,5 +1,4 @@
 import argparse
-import math
 import os
 import queue
 import socket
@@ -28,23 +27,28 @@ DEFAULT_RENDER_HZ = 50  # 界面刷新频率
 DEFAULT_SERIAL_OPEN_TIMEOUT_S = 3.0
 DEFAULT_SERIAL_WRITE_TIMEOUT_S = 0.5
 MAX_GATEWAY_DATAGRAMS_PER_LOOP = 32
-# 仅用于面板显示，不修改接收缓存或回传协议。
-FLOAT_PRECISION = dict.fromkeys(
-    ("surge", "sway", "heave", "roll", "pitch", "yaw", "yaw_sp", "rate_sp",
-     "temp_c", "humidity_rh", "voltage_v", "current_a", "power_w",
-     "pressure_mbar", "surface_mbar", "roll_deg", "pitch_deg", "yaw_deg"), 2
-) | dict.fromkeys(
-    ("lx", "ly", "rx", "ry", "l2", "r2", "depth_m",
-     "ax_mps2", "ay_mps2", "az_mps2", "gx_dps", "gy_dps", "gz_dps"), 3
-)
-TEXT_WIDTHS = {"mode": 9, "action": 34, "dpad": 10, "stab_fault": 11}
-INTEGER_WIDTHS = {
-    "uptime_ms": 10, "pkt_seq": 10, "pkt_age_ms": 5,
-    "timeout_count": 10, "rx_rejected": 10, "buttons": 10,
-    "ready": 1, "limit": 4, "teensy_connected": 1, "teensy_age_ms": 10,
-}
-MOTOR_FIELDS = tuple(f"m{index}" for index in range(1, 9))
-PANEL_COLUMNS = 79
+# DISPLAY_TAGS = [
+#     "CTRL",
+#     "SYS",
+#     "DS5",
+#     "MIX",
+#     "PWM",
+#     "SHT40",
+#     "PM08",
+#     "DEPTH",
+#     "IMU",
+# ]
+DISPLAY_TAGS = [
+    "SYS",
+    "DS5",
+    "CTRL",
+    "MIX",
+    "PWM",
+    "SHT40",
+    "PM08",
+    "DEPTH",
+    "IMU",
+]
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
@@ -229,125 +233,32 @@ def update_panel_state(
             panel_state["INFO"] = line
 
 
-def format_panel_value(tag: str, key: str, value: str | None) -> str:
-    if key in TEXT_WIDTHS:
-        width = TEXT_WIDTHS[key]
-        text = value or "---"
-        return (text if len(text) <= width else "OVF").ljust(width)
-
-    precision = 2 if tag == "MIX" and key in MOTOR_FIELDS else FLOAT_PRECISION.get(key)
-    width = 9 if precision is not None else INTEGER_WIDTHS.get(key)
-    if tag == "MIX" and key in MOTOR_FIELDS:
-        width = 8
-    if key.endswith("_alive"):
-        width = 1
-    if tag == "PWM" and key in MOTOR_FIELDS:
-        width = 4
-    if width is None:
-        return value or "---"
-
-    text = "---"[:width]
-    if value:
-        try:
-            if precision is not None:
-                number = float(value)
-                text = f"{number:+.{precision}f}" if math.isfinite(number) else "ERR"
-            elif tag == "PWM" and key == "limit":
-                text = f"{int(value.removesuffix('%'))}%"
-            else:
-                text = str(int(value))
-        except ValueError:
-            text = "ERR"
-    if len(text) > width:
-        text = "OVF" if width >= 3 else "!" * width
-    return text.rjust(width)
-
-
-def parse_panel_fields(line: str) -> dict[str, str]:
-    _, separator, body = line.partition("{")
-    if not separator or not body.endswith("}"):
-        return {}
-    return {
-        key: value
-        for key, separator, value in (token.partition("=") for token in body[:-1].split())
-        if separator
-    }
-
-
 def build_panel_lines(
     panel_state: dict[str, str],
     send_hz: float,
     render_hz: float,
     title: str = "DS5 -> Teensy demo",
 ) -> list[str]:
-    fields = {tag: parse_panel_fields(line) for tag, line in panel_state.items()}
-
-    def value(tag: str, key: str) -> str:
-        return format_panel_value(tag, key, fields.get(tag, {}).get(key)).strip()
-
-    def cell(tag: str, key: str, label: str = "") -> str:
-        return f"{label or key:<11} {value(tag, key):>11}"
-
-    def row(label: str, *cells: str) -> str:
-        return f"{label:<7} " + " ".join(cells)
-
-    online = {"1": "ON", "0": "OFF", "-": "---", "!": "ERR"}
-    # 普通数据三列，电机使用共用表头；所有常规行最多 79 字符。
     lines = [
         f"{title} | send={send_hz:.0f}Hz | render={render_hz:.0f}Hz",
-        "-" * PANEL_COLUMNS,
-        row("SYS", cell("SYS", "uptime_ms"), cell("SYS", "pkt_seq"),
-            cell("SYS", "pkt_age_ms", "age_ms")),
-        row("", cell("SYS", "timeout_count", "timeouts"), cell("SYS", "rx_rejected"),
-            cell("SYS", "stab_fault", "fault")),
-        row("ONLINE", *(
-            f"{sensor:<5} {online.get(value('SYS', key), '---'):>5}"
-            for sensor, key in (
-                ("PKT", "pkt_alive"), ("SHT40", "sht40_alive"),
-                ("PM08", "pm08_alive"), ("DEPTH", "depth_alive"), ("IMU", "imu_alive")
-            )
-        )),
-        row("INPUT", cell("DS5", "buttons"), cell("DS5", "dpad"), cell("CTRL", "mode")),
-        row("STICKS", cell("DS5", "lx"), cell("DS5", "ly"), cell("DS5", "rx")),
-        row("", cell("DS5", "ry"), cell("DS5", "l2"), cell("DS5", "r2")),
-        row("ACTION", value("CTRL", "action")),
-        row("CTRL", cell("CTRL", "surge"), cell("CTRL", "sway"),
-            cell("CTRL", "heave")),
-        row("", cell("CTRL", "roll"), cell("CTRL", "pitch"), cell("CTRL", "yaw")),
-        row("TARGET", cell("CTRL", "yaw_sp", "yawSP deg"),
-            cell("CTRL", "rate_sp", "rateSP d/s"), cell("PWM", "limit", "PWM limit")),
-        row("MOTOR", *(f"{key.upper():>8}" for key in MOTOR_FIELDS)),
-        row("MIX", *(f"{value('MIX', key):>8}" for key in MOTOR_FIELDS)),
-        row("PWM us", *(f"{value('PWM', key):>8}" for key in MOTOR_FIELDS)),
-        row("SHT40", cell("SHT40", "temp_c", "temp C"),
-            cell("SHT40", "humidity_rh", "humidity %")),
-        row("PM08", cell("PM08", "voltage_v", "voltage V"),
-            cell("PM08", "current_a", "current A"), cell("PM08", "power_w", "power W")),
-        row("", cell("PM08", "temp_c", "temp C")),
-        row("DEPTH", cell("DEPTH", "depth_m", "depth m"),
-            cell("DEPTH", "pressure_mbar", "press mbar"), cell("DEPTH", "temp_c", "temp C")),
-        row("", cell("DEPTH", "surface_mbar", "surface mb")),
-        row("IMU", cell("IMU", "temp_c", "temp C")),
-        row("ACC", cell("IMU", "ax_mps2", "ax m/s2"),
-            cell("IMU", "ay_mps2", "ay m/s2"), cell("IMU", "az_mps2", "az m/s2")),
-        row("GYR", cell("IMU", "gx_dps", "gx deg/s"),
-            cell("IMU", "gy_dps", "gy deg/s"), cell("IMU", "gz_dps", "gz deg/s")),
-        row("ANG", cell("IMU", "roll_deg", "roll deg"),
-            cell("IMU", "pitch_deg", "pitch deg"), cell("IMU", "yaw_deg", "yaw deg")),
+        "-" * 72,
     ]
 
+    for tag in DISPLAY_TAGS:
+        lines.append(panel_state.get(tag, f"{tag}{{waiting}}"))
+
     if "GATEWAY" in panel_state:
-        lines.append(row("GATEWAY", cell("GATEWAY", "teensy_connected", "connected"),
-                         cell("GATEWAY", "teensy_age_ms", "age_ms")))
+        lines.append(panel_state["GATEWAY"])
+
     if "INFO" in panel_state:
-        info = panel_state["INFO"]
-        lines.append(info if len(info) <= PANEL_COLUMNS else info[:PANEL_COLUMNS - 3] + "...")
+        lines.append(panel_state["INFO"])
+
     return lines
 
 
 def render_panel(lines: list[str]) -> None:
-    # 从原位覆盖并清除行尾，不整屏清空；末行不换行，避免满屏时滚动。
-    sys.stdout.write("\x1b[H" + "\n".join(line + "\x1b[K" for line in lines) + "\x1b[J")
+    sys.stdout.write("\x1b[2J\x1b[H")
+    sys.stdout.write("\n".join(lines) + "\n")
     sys.stdout.flush()
 
 
@@ -433,7 +344,7 @@ def run_ds5_debug(args: argparse.Namespace) -> int:
             )
             time.sleep(1.0 / args.render_hz)
     except RuntimeError as exc:
-        print(f"\n{exc}")
+        print(exc)
         return 1
     except KeyboardInterrupt:
         print("\nStop DS5 debug")
@@ -504,7 +415,7 @@ def run_serial_demo(
 
             time.sleep(0.001)
     except (RuntimeError, serial.SerialException) as exc:
-        print(f"\n{exc}")
+        print(exc)
         return 1
     except KeyboardInterrupt:
         print("\nStop DS5 demo")
@@ -563,7 +474,7 @@ def run_gateway_demo(
 
                 time.sleep(0.001)
     except RuntimeError as exc:
-        print(f"\n{exc}")
+        print(exc)
         return 1
     except KeyboardInterrupt:
         print("\nStop DS5 gateway demo")
