@@ -1,6 +1,6 @@
 # ROV Controller 项目交接
 
-> 最近源码核对：2026-10-13
+> 最近源码核对：2026-10-14
 >
 > 通信基线：串口与 Gateway 模式共用同一套 `PKT`/标签文本
 
@@ -14,12 +14,14 @@
 - 将控制状态发送给 Teensy 或 Jetson Gateway；
 - 缓存并显示最新的下位机回显；
 - 检查 Windows 和 Linux 下的 DS5 原始映射。
+- 可选将串口偏航遥测转发给本机 VOFA 绘图。
 
 当前链路：
 
 ```text
 串口调试：
 DS5 -> Controller -> USB/PKT -> Teensy
+Teensy -> Controller -> UDP/FireWater :1347 -> 本机 VOFA（可选、只读）
 
 三层联调：
 DS5 -> Controller -> UDP/PKT :14550 -> Jetson rov_gateway
@@ -41,6 +43,7 @@ DS5 -> Controller -> UDP/PKT :14550 -> Jetson rov_gateway
 - 可配置控制发送频率、面板刷新频率、串口和 Gateway 地址。
 - 可选文本日志。
 - Windows 串口打开超时和串口写入超时保护。
+- 串口模式 `--vofa`：将有效自稳快照中的四通道偏航遥测转发到本机 UDP，最多 50Hz。
 
 固定面板标签：
 
@@ -50,7 +53,7 @@ CTRL SYS DS5 MIX PWM SHT40 PM08 DEPTH IMU
 
 Gateway 模式额外显示 `GATEWAY`；无标签信息使用 `INFO` 显示。
 
-IMU仅在绘制时解析，温度/角度保留2位小数，加速度/角速度保留3位小数；每个数值占9字符，缺失为`---`、无效为`ERR`、超宽为`OVF`。三轴行固定64字符，未收到IMU时也保留四行占位。
+面板中的IMU仅在绘制时解析，温度/角度保留2位小数，加速度/角速度保留3位小数；每个数值占9字符，缺失为`---`、无效为`ERR`、超宽为`OVF`。三轴行固定64字符，未收到IMU时也保留四行占位。VOFA另从原始遥测解析所需字段，不读取面板格式化结果。
 
 ACC/GYR/ANG只是显示分组，固件仍只回传IMU标签。缓存、日志、收发、默认50Hz频率及其余标签的布局均不变，不修改Teensy固件。新增IMU字段需更新`IMU_ROWS`；其他标签继续原样显示完整字段。
 
@@ -66,10 +69,12 @@ ACC/GYR/ANG只是显示分组，固件仍只回传IMU标签。缓存、日志、
 - 当前最新固件全部传感器标签经 Gateway 的完整联调。
 - Linux 上十字键、面键、L3/R3 和扳机轴的最终映射。
 - 更换手柄、系统或 SDL 版本后的轴编号一致性。
+- VOFA 实际界面与 DS5、Teensy 串口同时运行时的曲线和持续控制；本次仅完成软件测试和 UDP 回环收包。
 
 ### 未实现
 
-- 正式产品 UI、任务控制、参数配置和数据可视化。
+- 正式产品 UI、任务控制、参数配置和自建数据可视化界面；当前绘图复用外部 VOFA。
+- VOFA 调参命令、Gateway 到 VOFA 转发、其余三个闭环轴的通道。
 - 串口掉线后的自动重连。
 - 多 Gateway 控制端仲裁。
 - 带真实 Gateway、Teensy 和 DS5 的自动化集成测试。
@@ -92,8 +97,8 @@ Controller/
 | 文件 | 职责 |
 | --- | --- |
 | `ds5_reader.py` | 初始化 pygame，读取 DS5，归一化轴和打包按钮 |
-| `ds5_teensy_demo.py` | 参数解析、串口/UDP 通信、状态缓存、固定面板和日志 |
-| `test_ds5_teensy_demo.py` | raw Gateway 文本行和接收预算的最小单元测试 |
+| `ds5_teensy_demo.py` | 参数解析、串口/UDP 通信、状态缓存、固定面板、日志和可选 VOFA 偏航转发 |
+| `test_ds5_teensy_demo.py` | Gateway、IMU 排版和 VOFA 转发的最小软件检查 |
 | `pyproject.toml` | Python 版本与直接依赖 |
 | `uv.lock` | 可复现依赖锁定 |
 
@@ -115,12 +120,13 @@ Controller/
 | 串口写入超时 | 0.5s |
 | 串口读取超时 | 1ms |
 | 串口打开后等待 | 2.0s |
+| VOFA（默认关闭） | 本机 `127.0.0.1:1347`，UDP/FireWater，最多 50Hz |
 
 串口循环：
 
 ```text
 读取现有串口数据 -> 更新标签缓存 -> 读取DS5
--> 到期时发送PKT -> 到期时重绘面板 -> sleep 1ms
+-> 到期时发送PKT -> 可选转发VOFA -> 到期时重绘面板 -> sleep 1ms
 ```
 
 Gateway 循环结构相同，但使用非阻塞 UDP socket，每轮最多处理 32 个数据报。Windows 上 socket 必须先绑定本地临时端口，Gateway 才能把标签行回传到正确源端口。
@@ -144,7 +150,7 @@ PKT <seq> <lx> <ly> <rx> <ry> <l2> <r2> <buttons>
 - 十字键固定使用 bit 11 至 bit 14；
 - 每行以换行符结束。
 
-Teensy 回显通过 `TAG{...}` 的标签前缀进入最新值缓存。面板不解析标签内部字段，因此字段增减通常不需要修改 Controller。
+Teensy 回显通过 `TAG{...}` 的标签前缀进入最新值缓存。除 IMU 排版和 VOFA 必需字段外，标签内部字段保持原样，新增普通字段通常不需要修改 Controller。
 
 ### Gateway raw UDP
 
@@ -155,6 +161,18 @@ Teensy 回显通过 `TAG{...}` 的标签前缀进入最新值缓存。面板不�
 - Controller 不解析标签内部业务字段，只按 `{` 前面的标签名缓存最新行。
 
 Gateway 当前按最后一个合法 PC 地址回传文本，因此 Python Controller 和 C# 上位机不能同时控制同一个 Gateway。
+
+### VOFA 本机 UDP
+
+- 仅串口模式通过 `--vofa` 开启；`--vofa-port` 默认 1347。不能与 Gateway 或 `--ds5-debug` 组合。
+- Controller 独占 Teensy 串口，VOFA 只监听本机 UDP，不打开 COM8。
+- 使用 [FireWater](https://www.vofa.plus/docs/learning/dataengines/firewater/)：一个数据报一行 CSV，以 `\n` 结束。例如 `yaw:110.09,112.09,-4,-0.031\n`。
+- 四通道顺序固定为 `CTRL.yaw_sp`、`IMU.yaw_deg`、`CTRL.rate_sp`、`IMU.gz_dps`，前两个单位 deg，后两个 deg/s。
+- 只在 `CTRL.mode=STABILIZE` 且 `SYS.imu_alive=1` 时转发；alive 只用于内部检查，不作为第五通道。字段缺失、格式错误、NaN/Inf 时丢弃，不用零值代替。
+- 按当前固件快照顺序配对：`CTRL` 开始，随后 `SYS`，`IMU` 结束。跨串口读取保留未完成快照，遇到新 `CTRL` 或 `SYS{ready=1}` 时重置，不能与旧快照混用。若固件更改输出顺序，需同步调整这里。
+- 使用单调时钟限频，最多 50Hz，与面板刷新和手柄发包频率无关。只保留一份待发数据，等待超过 100ms 时丢弃；没有新快照时不持续重放旧值。
+- UDP 非阻塞发送，失败只丢绘图帧，不重试、不阻断手柄发包。socket 创建失败时显示 `INFO{vofa=disabled ...}`，继续原有串口控制。
+- 原始面板缓存、日志、PKT、手柄映射和 Teensy 固件均不修改。不做额外滤波、角度展开或 PID 运算。
 
 ## 6. 环境与命令
 
@@ -169,6 +187,12 @@ uv sync
 
 ```powershell
 uv run python ds5_teensy_demo.py --mode serial --teensy-port COM8
+```
+
+串口模式转发 VOFA（接收端选择 UDP/FireWater、本地监听 1347）：
+
+```powershell
+uv run python ds5_teensy_demo.py --mode serial --teensy-port COM8 --vofa
 ```
 
 Gateway 模式：
@@ -215,8 +239,10 @@ uv run python ds5_teensy_demo.py --help
 3. 停止 Controller，确认 Teensy 按自身超时策略回到安全输出。
 4. Gateway 模式确认 `GATEWAY{}` 和所有传感器标签更新。
 5. 同一时间只运行一个串口占用者和一个 Gateway 控制端。
+6. 加 `--vofa`，按 R1 请求自稳；确认 `mode=STABILIZE`、`imu_alive=1`，VOFA 四通道与 Controller 原始字段一致，角度与角速度分别绘图。
+7. 切回 MANUAL 或 IMU 掉线后应停止转发；恢复有效自稳后重新出现曲线。停止 VOFA 不应中断 Controller 手柄控制。
 
-当前5项单元测试覆盖raw Gateway协议、仅IMU排版、固定列宽以及缓存和日志原样保留；unittest、compileall和--help通过。已用用户截图数据生成并查看终端预览，未进行新的DS5、Teensy或Gateway实机验证。
+当前12项测试覆盖raw Gateway协议、仅IMU排版、缓存和日志原样保留，以及VOFA四通道编码、无效数据拒绝、分段快照配对、限频、不重放旧值、过期丢帧、参数校验和UDP故障时继续发送原始PKT。真实本机UDP回环确认收到FireWater报文；unittest、compileall和--help通过。未进行新的VOFA界面、DS5、Teensy或Gateway实机验证。
 
 ## 8. 已知问题与排查
 
@@ -228,6 +254,8 @@ uv run python ds5_teensy_demo.py --help
 | 标签停在 `waiting` | Teensy 固件是否输出该标签、Gateway 是否收到并回传该行 |
 | 数值停住但仍显示 | 面板保存最后值，必须结合 `SYS{}` 中对应 `alive` 判断新鲜度 |
 | Gateway 无回包 | Jetson 地址/端口、防火墙、Gateway 是否运行及 UDP 源端口绑定 |
+| VOFA 没有曲线 | 是否加 `--vofa`、本地监听端口是否一致、协议是否 FireWater、是否有效 STABILIZE、固件是否输出 `yaw_sp/rate_sp` |
+| VOFA 曲线停住 | MANUAL、IMU 掉线或没有新快照时主动停止转发，不代表手柄控制已停止 |
 | Linux 扳机静止为 0.5 | SDL 轴初值或映射不同，先用 `--ds5-debug` 记录 raw 值 |
 
 当前串口读取会处理当时全部 `in_waiting` 数据；UDP 每轮最多接收 32 个数据报。若实测串口持续积压，再为串口路径增加明确预算，不提前搭建额外线程或队列框架。

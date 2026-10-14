@@ -28,6 +28,15 @@ DEFAULT_RENDER_HZ = 50  # 界面刷新频率
 DEFAULT_SERIAL_OPEN_TIMEOUT_S = 3.0
 DEFAULT_SERIAL_WRITE_TIMEOUT_S = 0.5
 MAX_GATEWAY_DATAGRAMS_PER_LOOP = 32
+DEFAULT_VOFA_PORT = 1347
+VOFA_SEND_PERIOD_S = 0.02  # 最多 50Hz，不随面板刷新频率变化
+VOFA_FRAME_TIMEOUT_S = 0.1  # 丢弃在电脑上停留过久的待发数据
+VOFA_YAW_FIELDS = (
+    ("CTRL", "yaw_sp"),   # 期望偏航角，单位 deg
+    ("IMU", "yaw_deg"),   # 实际偏航角，单位 deg
+    ("CTRL", "rate_sp"),  # 期望偏航角速度，单位 deg/s
+    ("IMU", "gz_dps"),    # 实际偏航角速度，单位 deg/s
+)
 # DISPLAY_TAGS = [
 #     "CTRL",
 #     "SYS",
@@ -92,6 +101,14 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="Only show raw DS5 axes/buttons/hats and packed snapshot; no serial",
     )
     parser.add_argument("--log-file", default="")
+    parser.add_argument(
+        "--vofa",
+        action="store_true",
+        help="Forward yaw telemetry to VOFA via local UDP (serial mode only)",
+    )
+    parser.add_argument(
+        "--vofa-port", type=int, default=DEFAULT_VOFA_PORT, help="VOFA UDP listening port"
+    )
     return parser
 
 
@@ -238,6 +255,66 @@ def update_panel_state(
             panel_state[tag] = line
         else:
             panel_state["INFO"] = line
+
+
+def build_vofa_yaw_frame(snapshot: dict[str, str]) -> bytes | None:
+    try:
+        fields = {}
+        for tag in ("CTRL", "SYS", "IMU"):
+            line = snapshot[tag]
+            if not line.startswith(tag + "{") or not line.endswith("}"):
+                return None
+            fields[tag] = dict(token.split("=", 1) for token in line[len(tag) + 1 : -1].split())
+        if fields["CTRL"].get("mode") != "STABILIZE" or fields["SYS"].get("imu_alive") != "1":
+            return None
+        values = [float(fields[tag][key]) for tag, key in VOFA_YAW_FIELDS]
+    except (KeyError, ValueError):
+        return None
+    if not all(math.isfinite(value) for value in values):
+        return None
+    return ("yaw:" + ",".join(f"{value:.9g}" for value in values) + "\n").encode("ascii")
+
+
+class VofaYawSender:
+    def __init__(self, port: int) -> None:
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.setblocking(False)
+        self.target = ("127.0.0.1", port)
+        self.snapshot: dict[str, str] = {}
+        self.pending: tuple[float, bytes] | None = None
+        self.last_send = -math.inf
+
+    def update(self, lines: list[str], now: float) -> None:
+        # ponytail: 当前固件快照以 CTRL 开始、IMU 结束，顺序变化时需同步调整。
+        for line in lines:
+            tag = extract_tag(line)
+            if tag == "CTRL":
+                self.snapshot = {"CTRL": line}
+                self.pending = None
+            elif line == "SYS{ready=1}":
+                self.snapshot.clear()
+                self.pending = None
+            elif tag in ("SYS", "IMU") and self.snapshot:
+                self.snapshot[tag] = line
+                if tag == "IMU":
+                    frame = build_vofa_yaw_frame(self.snapshot)
+                    self.pending = (now, frame) if frame is not None else None
+                    self.snapshot.clear()
+
+        if self.pending is None or now - self.last_send < VOFA_SEND_PERIOD_S:
+            return
+        received_at, frame = self.pending
+        self.pending = None
+        if now - received_at > VOFA_FRAME_TIMEOUT_S:
+            return
+        self.last_send = now
+        try:
+            self.socket.sendto(frame, self.target)
+        except OSError:
+            pass  # 绘图数据发送失败时丢帧，不重试，不中断手柄控制
+
+    def close(self) -> None:
+        self.socket.close()
 
 
 def format_imu_lines(line: str) -> list[str]:
@@ -394,6 +471,7 @@ def run_serial_demo(
     log_file: TextIO | None,
 ) -> int:
     serial_port: serial.Serial | None = None
+    vofa: VofaYawSender | None = None
     sequence = 0
     read_buffer = ""
     last_send = 0.0
@@ -401,6 +479,11 @@ def run_serial_demo(
     panel_state: dict[str, str] = {}
 
     try:
+        if args.vofa:
+            try:
+                vofa = VofaYawSender(args.vofa_port)
+            except OSError as exc:
+                panel_state["INFO"] = f"INFO{{vofa=disabled error={exc}}}"
         joystick_name = ds5_reader.open()
         print(f"Joystick: {joystick_name}")
 
@@ -437,6 +520,9 @@ def run_serial_demo(
                     ) from exc
                 last_send = now
 
+            if vofa is not None:
+                vofa.update(lines, time.monotonic())
+
             if now - last_render >= 1.0 / args.render_hz:
                 render_panel(
                     build_panel_lines(
@@ -456,6 +542,8 @@ def run_serial_demo(
         print("\nStop DS5 demo")
         return 0
     finally:
+        if vofa is not None:
+            vofa.close()
         if serial_port is not None:
             serial_port.close()
 
@@ -517,7 +605,12 @@ def run_gateway_demo(
 
 
 def main() -> int:
-    args = build_argument_parser().parse_args()
+    parser = build_argument_parser()
+    args = parser.parse_args()
+    if not 1 <= args.vofa_port <= 65535:
+        parser.error("--vofa-port must be between 1 and 65535")
+    if args.vofa and (args.mode != "serial" or args.ds5_debug):
+        parser.error("--vofa requires serial mode without --ds5-debug")
 
     if args.sdl_joystick_device:
         os.environ["SDL_JOYSTICK_DEVICE"] = args.sdl_joystick_device

@@ -48,6 +48,29 @@ CTRL{} SYS{} DS5{} MIX{} PWM{} SHT40{} PM08{} DEPTH{} IMU{}
 uv run python ds5_teensy_demo.py --mode serial --teensy-port COM8 --render-hz 10
 ```
 
+### VOFA 偏航曲线
+
+在串口模式增加 `--vofa`，将偏航闭环的四个数值转发到本机 VOFA：
+
+```powershell
+uv run python ds5_teensy_demo.py --mode serial --teensy-port COM8 --vofa
+```
+
+VOFA 选择 **UDP**，本地监听地址设为 `127.0.0.1`（或 `0.0.0.0`），监听端口设为 **1347**，协议选择 [FireWater](https://www.vofa.plus/docs/learning/dataengines/firewater/)。VOFA 不要打开 COM8，串口仍由 Controller 独占。
+
+| 通道 | 数值 | 单位 |
+| --- | --- | --- |
+| 0 | 期望 yaw 角：`CTRL.yaw_sp` | deg |
+| 1 | 实际 yaw 角：`IMU.yaw_deg` | deg |
+| 2 | 期望角速度：`CTRL.rate_sp` | deg/s |
+| 3 | 实际角速度：`IMU.gz_dps` | deg/s |
+
+建议用两个波形图：通道 0、1 放在角度图，通道 2、3 放在角速度图。按 R1 请求自稳，确认 Controller 显示 `mode=STABILIZE` 且 `imu_alive=1` 后才会有曲线；手动模式、掉线或字段无效时停止转发，不补零、不重复旧数据。
+
+转发最多 50Hz，不受 `--render-hz` 影响。更换端口时使用 `--vofa-port 1348`，VOFA 的监听端口也改为同一个值。不加 `--vofa` 时行为不变。
+
+本次只转发数据，不接收 VOFA 调参命令，也不支持 Gateway 模式。已运行当前输出 `yaw_sp/rate_sp` 的闭环固件时，无需为这一步重新烧录 Teensy。
+
 ## Gateway 模式
 
 先在 Jetson 上启动 `rov_gateway`，再在 PC 上运行：
@@ -88,6 +111,8 @@ uv run python ds5_teensy_demo.py \
 | `--render-hz` | `50` | 状态面板刷新频率 |
 | `--deadzone` | `0.08` | 摇杆死区 |
 | `--log-file` | 空 | 将收到的回显追加到文件 |
+| `--vofa` | 关闭 | 串口模式下转发四通道偏航数据 |
+| `--vofa-port` | `1347` | 本机 VOFA 的 UDP 监听端口 |
 
 查看全部参数：
 
