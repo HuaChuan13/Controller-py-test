@@ -38,7 +38,7 @@ DS5 -> Controller -> UDP/PKT :14550 -> Jetson rov_gateway
 - `serial` 模式：通过 USB 串口发送 Teensy `PKT`。
 - `gateway` 模式：通过 UDP 直接发送 `PKT`，并接收逐行回传的 Teensy 标签。
 - 单一完整状态面板，不再提供普通/调试视图切换。
-- `CTRL{}`后增加最新`PID{}`原文，随面板50Hz刷新，与约200Hz VOFA逐帧转发独立，不增加USB或UDP数据。
+- IMU四行（IMU/ACC/GYR/ANG）之后显示最新`PID{}`原文，随面板50Hz刷新，与约200Hz VOFA逐帧转发独立，不增加USB或UDP数据。
 - 仅IMU显示拆为温度、加速度（ACC）、角速度（GYR）、角度（ANG）四行并固定列宽，其余标签保持原始文本。
 - `--ds5-debug` 原始轴、按键、十字键和打包结果检查。
 - 可配置控制发送频率、面板刷新频率、串口和 Gateway 地址。
@@ -50,7 +50,7 @@ DS5 -> Controller -> UDP/PKT :14550 -> Jetson rov_gateway
 固定面板标签：
 
 ```text
-SYS DS5 CTRL PID MIX PWM SHT40 PM08 DEPTH IMU
+SYS DS5 CTRL MIX PWM SHT40 PM08 DEPTH IMU PID
 ```
 
 Gateway 模式额外显示 `GATEWAY`；无标签信息使用 `INFO` 显示。

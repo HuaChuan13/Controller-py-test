@@ -51,13 +51,13 @@ DISPLAY_TAGS = [
     "SYS",
     "DS5",
     "CTRL",
-    "PID",
     "MIX",
     "PWM",
     "SHT40",
     "PM08",
     "DEPTH",
     "IMU",
+    "PID",
 ]
 IMU_ROWS = (
     ("IMU", ("temp_c",), 2),

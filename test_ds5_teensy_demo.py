@@ -48,19 +48,22 @@ class GatewayLineTests(unittest.TestCase):
 class ImuPanelTests(unittest.TestCase):
     def test_only_imu_display_changes_and_raw_data_stays_unchanged(self) -> None:
         received = [f"{tag}{{raw=+12.345 unknown=unchanged}}" for tag in DISPLAY_TAGS]
-        received[-1] = "IMU{temp_c=26 ax_mps2=-0.066 yaw_deg=0.84}"
+        imu_index = DISPLAY_TAGS.index("IMU")
+        received[imu_index] = "IMU{temp_c=26 ax_mps2=-0.066 yaw_deg=0.84}"
         received += ["GATEWAY{teensy_connected=1}", "INFO{unchanged}"]
         state: dict[str, str] = {}
         log = io.StringIO()
         update_panel_state(received, state, log)
         original = dict(state)
         rows = build_panel_lines(state, 50, 50)
-        self.assertEqual(rows[2:2 + len(DISPLAY_TAGS) - 1], received[:len(DISPLAY_TAGS) - 1])
+        self.assertEqual(rows[2:2 + imu_index], received[:imu_index])
+        self.assertEqual(rows[2 + imu_index + 4], state["PID"])
         self.assertEqual(rows[-2:], received[-2:])
         self.assertEqual(state, original)
         self.assertEqual(log.getvalue(), "".join(f"[Teensy] {line}\n" for line in received))
 
     def test_imu_columns_stay_fixed_for_changed_missing_and_invalid_values(self) -> None:
+        imu_index = 2 + DISPLAY_TAGS.index("IMU")
         frames = (
             "IMU{waiting}",
             "IMU{temp_c=26 ax_mps2=-0.066 ay_mps2=0.043 az_mps2=9.781 "
@@ -72,14 +75,14 @@ class ImuPanelTests(unittest.TestCase):
             "IMU{temp_c=nan ax_mps2=broken gx_dps=inf yaw_deg=1e30}",
         )
         for frame in frames:
-            rows = build_panel_lines({"IMU": frame}, 50, 50)[-4:]
+            rows = build_panel_lines({"IMU": frame}, 50, 50)[imu_index:imu_index + 4]
             self.assertEqual([len(row) for row in rows], [24, 64, 64, 64])
             self.assertEqual([row[:3] for row in rows], ["IMU", "ACC", "GYR", "ANG"])
             for row in rows[1:]:
                 self.assertEqual([index for index, char in enumerate(row) if char == "="],
                                  [13, 33, 53])
-        self.assertIn("---", build_panel_lines({}, 50, 50)[-1])
-        rows = build_panel_lines({"IMU": frames[-1]}, 50, 50)[-4:]
+        self.assertIn("---", build_panel_lines({}, 50, 50)[imu_index + 3])
+        rows = build_panel_lines({"IMU": frames[-1]}, 50, 50)[imu_index:imu_index + 4]
         self.assertIn("ERR", rows[0])
         self.assertIn("ERR", rows[1])
         self.assertIn("ERR", rows[2])
@@ -144,7 +147,7 @@ class VofaTests(unittest.TestCase):
         self.assertEqual(panel["SYS"], "SYS{sample=196}")
         self.assertTrue(all(call.args[0] <= 4096 for call in port.read.call_args_list))
         latest = self.line.replace("112.09", "199")
-        self.assertIn(latest, build_panel_lines(panel, 200, 50))
+        self.assertEqual(build_panel_lines(panel, 200, 50)[-1], latest)
         self.assertIn("PID{waiting}", build_panel_lines({}, 200, 50))
         update_panel_state([], panel, None)
         self.assertIn(latest, build_panel_lines(panel, 200, 50))
