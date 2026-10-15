@@ -1,22 +1,27 @@
 import io
+import select
 import socket
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import serial
+
 from ds5_teensy_demo import (
     DISPLAY_TAGS,
-    VofaYawSender,
+    VofaBridge,
     build_argument_parser,
     build_panel_lines,
     build_vofa_yaw_frame,
     decode_gateway_line,
     main,
+    normalize_vofa_command,
     read_available_gateway_lines,
     read_available_lines,
     run_serial_demo,
     update_panel_state,
+    write_serial_data,
 )
 
 
@@ -107,8 +112,9 @@ class VofaTests(unittest.TestCase):
 
     def test_split_serial_line_is_forwarded_only_when_complete(self) -> None:
         with patch("ds5_teensy_demo.socket.socket") as factory:
-            sender = VofaYawSender(1347)
+            sender = VofaBridge(1347)
         sock = factory.return_value
+        sock.bind.assert_called_once_with(("127.0.0.1", 1346))
         sock.setblocking.assert_called_once_with(False)
         port = Mock(in_waiting=100)
         port.read.side_effect = [self.line[:20].encode(), (self.line[20:] + "\r\n").encode()]
@@ -129,14 +135,14 @@ class VofaTests(unittest.TestCase):
         for i in range(200):
             rows.append(self.line.replace("112.09", str(i)))
             if i % 4 == 0:
-                rows.extend(f"{tag}{{sample={i}}}" for tag in DISPLAY_TAGS if tag != "PID")
+                rows.extend(f"{tag}{{sample={i}}}" for tag in DISPLAY_TAGS if tag not in ("PID", "PARAM"))
         stream = io.BytesIO(("\n".join(rows) + "\n").encode())
         port = Mock()
         port.read.side_effect = stream.read
         panel = {}
         buffer = ""
         with patch("ds5_teensy_demo.socket.socket") as factory:
-            sender = VofaYawSender(1347)
+            sender = VofaBridge(1347)
         while stream.tell() < len(stream.getvalue()):
             port.in_waiting = len(stream.getvalue()) - stream.tell()
             lines, buffer = read_available_lines(port, buffer)
@@ -147,7 +153,8 @@ class VofaTests(unittest.TestCase):
         self.assertEqual(panel["SYS"], "SYS{sample=196}")
         self.assertTrue(all(call.args[0] <= 4096 for call in port.read.call_args_list))
         latest = self.line.replace("112.09", "199")
-        self.assertEqual(build_panel_lines(panel, 200, 50)[-1], latest)
+        self.assertEqual(build_panel_lines(panel, 200, 50)[-2], latest)
+        self.assertEqual(build_panel_lines(panel, 200, 50)[-1], "PARAM{waiting}")
         self.assertIn("PID{waiting}", build_panel_lines({}, 200, 50))
         update_panel_state([], panel, None)
         self.assertIn(latest, build_panel_lines(panel, 200, 50))
@@ -199,7 +206,7 @@ class VofaTests(unittest.TestCase):
         panel = {}
         log = io.StringIO()
         with patch("ds5_teensy_demo.socket.socket") as factory:
-            sender = VofaYawSender(1347)
+            sender = VofaBridge(1347)
         while stream.tell() < len(stream.getvalue()):
             port.in_waiting = len(stream.getvalue()) - stream.tell()
             rows, buffer = read_available_lines(port, buffer)
@@ -217,7 +224,7 @@ class VofaTests(unittest.TestCase):
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as receiver:
             receiver.bind(("127.0.0.1", 0))
             receiver.settimeout(1.0)
-            sender = VofaYawSender(receiver.getsockname()[1])
+            sender = VofaBridge(receiver.getsockname()[1], command_port=0)
             try:
                 for batch in range(50):
                     lines = [self.line.replace("112.09", str(batch * 4 + i)) for i in range(4)]
@@ -229,13 +236,112 @@ class VofaTests(unittest.TestCase):
             finally:
                 sender.close()
 
+    def test_yaw_command_whitelist_ranges_and_line_framing(self) -> None:
+        for gain, maximum in (("ANGLE_KP", 10), ("RATE_KP", 1), ("RATE_KI", 1), ("RATE_KD", 0.1)):
+            for value in (0, maximum):
+                command = f"CMD PID YAW {gain} {value}\r\n".encode()
+                self.assertEqual(normalize_vofa_command(command), f"CMD PID YAW {gain} {value:.9g}\n".encode())
+            for value in ("-1", "nan", "inf", "%f", "1.1e99", str(maximum + 1)):
+                with self.subTest(gain=gain, value=value), self.assertRaises(ValueError):
+                    normalize_vofa_command(f"CMD PID YAW {gain} {value}\n".encode())
+        for command in (
+            b"", b"x" * 129, b"\xff", b"CMD MODE STABILIZE\n", b"CMD LIMIT 100\n",
+            b"CMD PID YAW UNKNOWN 1\n", b"CMD PID YAW RATE_KP 0.02 junk\n",
+            b"CMD PID YAW RATE_KP 0.02\nCMD LIMIT 100\n",
+            b"CMD PID YAW RATE_KP 0.02\\r\\n",
+        ):
+            with self.subTest(command=command), self.assertRaises(ValueError):
+                normalize_vofa_command(command)
+
+    def test_vofa_peer_filter_one_datagram_budget_and_bind_failure(self) -> None:
+        with patch("ds5_teensy_demo.socket.socket") as factory:
+            bridge = VofaBridge(1347)
+        sock = factory.return_value
+        sock.recvfrom.side_effect = [
+            (b"CMD PID YAW RATE_KP 0.03\n", ("127.0.0.1", 1348)),
+            (b"CMD PID YAW RATE_KP 0.03\n", ("127.0.0.1", 1347)),
+            BlockingIOError,
+        ]
+        self.assertIsNone(bridge.read_command())
+        self.assertEqual(sock.recvfrom.call_count, 1)
+        self.assertEqual(bridge.read_command(), b"CMD PID YAW RATE_KP 0.03\n")
+        self.assertIsNone(bridge.read_command())
+        sock.recvfrom.assert_called_with(129)
+        bridge.close()
+        with patch("ds5_teensy_demo.socket.socket") as factory:
+            factory.return_value.bind.side_effect = OSError("port occupied")
+            with self.assertRaises(OSError):
+                VofaBridge(1347)
+            factory.return_value.close.assert_called_once()
+
+    def test_bidirectional_udp_and_cached_param_after_pid(self) -> None:
+        param = "PARAM{status=OK angle_kp=2.000000 rate_kp=0.030000 rate_ki=0.000000 rate_kd=0.000000}"
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as vofa:
+            vofa.bind(("127.0.0.1", 0))
+            vofa.settimeout(1.0)
+            bridge = VofaBridge(vofa.getsockname()[1], command_port=0)
+            try:
+                vofa.sendto(b"CMD PID YAW RATE_KP 0.030000\r\n", bridge.socket.getsockname())
+                self.assertTrue(select.select([bridge.socket], [], [], 1.0)[0])
+                self.assertEqual(bridge.read_command(), b"CMD PID YAW RATE_KP 0.03\n")
+                bridge.update([self.line, param, "PARAM{broken", "PARAM{bad=\ufffd}"])
+                self.assertEqual(vofa.recvfrom(1024)[0], self.frame)
+                self.assertEqual(vofa.recvfrom(1024)[0], (param + "\n").encode())
+                self.assertFalse(select.select([vofa], [], [], 0.01)[0])
+            finally:
+                bridge.close()
+        panel = {}
+        log = io.StringIO()
+        update_panel_state([self.line, param], panel, log)
+        self.assertEqual(build_panel_lines(panel, 200, 50)[-2:], [self.line, param])
+        update_panel_state([], panel, log)
+        self.assertEqual(log.getvalue().count("PARAM{"), 1)
+        self.assertEqual(build_panel_lines(panel, 200, 50)[-1], param)
+        update_panel_state(["SYS{ready=1}"], panel, None)
+        self.assertEqual(build_panel_lines(panel, 200, 50)[-1], "PARAM{waiting}")
+
+    def test_commands_share_serial_after_control_packets_and_bad_command_is_rejected(self) -> None:
+        args = build_argument_parser().parse_args(["--send-hz", "200", "--vofa"])
+        reader = Mock()
+        reader.read.return_value = SimpleNamespace(lx=0, ly=0, rx=0, ry=0, l2=0, r2=0, buttons=0)
+        port = Mock()
+        with (
+            patch("ds5_teensy_demo.open_serial_port", return_value=port),
+            patch("ds5_teensy_demo.read_available_lines", side_effect=[([], "")] * 3 + [KeyboardInterrupt]),
+            patch("ds5_teensy_demo.time.monotonic", side_effect=[1.0, 1.0051, 1.0211, 1.03]),
+            patch("ds5_teensy_demo.time.sleep"),
+            patch("ds5_teensy_demo.render_panel") as render,
+            patch("ds5_teensy_demo.socket.socket") as factory,
+            redirect_stdout(io.StringIO()),
+        ):
+            factory.return_value.recvfrom.side_effect = [
+                (b"CMD PID YAW RATE_KP 0.03\r\n", ("127.0.0.1", 1347)),
+                (b"CMD MODE STABILIZE\n", ("127.0.0.1", 1347)),
+                (b"CMD PID YAW RATE_KI 0.01\r\n", ("127.0.0.1", 1347)),
+            ]
+            self.assertEqual(run_serial_demo(args, reader, None), 0)
+        sent = [call.args[0] for call in port.write.call_args_list]
+        self.assertEqual([data.split()[0] for data in sent], [b"PKT", b"CMD", b"PKT", b"PKT", b"CMD"])
+        self.assertEqual(sent[1], b"CMD PID YAW RATE_KP 0.03\n")
+        self.assertEqual(sent[-1], b"CMD PID YAW RATE_KI 0.01\n")
+        self.assertIn("vofa_command=rejected", " ".join(render.call_args.args[0]))
+        port.close.assert_called_once()
+        factory.return_value.close.assert_called_once()
+        port.write.side_effect = serial.SerialTimeoutException()
+        with self.assertRaisesRegex(RuntimeError, "Serial write to COM8 timed out"):
+            write_serial_data(port, b"CMD PID YAW RATE_KP 0.03\n", "COM8")
+
     def test_cli_defaults_and_invalid_options_before_hardware_access(self) -> None:
         args = build_argument_parser().parse_args([])
         self.assertFalse(args.vofa)
         self.assertEqual(args.vofa_port, 1347)
+        self.assertEqual(args.vofa_command_port, 1346)
         for options in (
             ["--vofa-port", "0"],
             ["--vofa-port", "65536"],
+            ["--vofa-command-port", "0"],
+            ["--vofa-command-port", "65536"],
+            ["--vofa", "--vofa-command-port", "1347"],
             ["--vofa", "--mode", "gateway"],
             ["--vofa", "--ds5-debug"],
         ):
@@ -268,6 +374,7 @@ class VofaTests(unittest.TestCase):
                     redirect_stdout(io.StringIO()),
                 ):
                     factory.return_value.sendto.side_effect = BlockingIOError
+                    factory.return_value.recvfrom.side_effect = BlockingIOError
                     if socket_error:
                         factory.side_effect = OSError("UDP unavailable")
                     self.assertEqual(run_serial_demo(args, reader, None), 0)

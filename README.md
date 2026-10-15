@@ -37,7 +37,7 @@ uv run python ds5_teensy_demo.py --mode serial --teensy-port COM8
 `COM8` 需要按实际 Teensy 端口修改。面板固定显示：
 
 ```text
-SYS{} DS5{} CTRL{} MIX{} PWM{} SHT40{} PM08{} DEPTH{} IMU{} PID{}
+SYS{} DS5{} CTRL{} MIX{} PWM{} SHT40{} PM08{} DEPTH{} IMU{} PID{} PARAM{}
 ```
 
 只有IMU在显示端拆成温度、加速度（ACC）、角速度（GYR）、角度（ANG）四行，三轴数值使用固定列宽；其余标签保持原始文本。ACC/GYR/ANG不是新增回传标签，原始日志和50Hz频率不变，无需重新烧录Teensy。
@@ -75,7 +75,44 @@ VOFA 选择 **UDP**，本地监听地址设为 `127.0.0.1`（或 `0.0.0.0`），
 
 更换端口时使用 `--vofa-port 1348`，VOFA 的监听端口也改为同一个值。不加 `--vofa` 时不会创建 VOFA socket，但仍显示收到的PID行。
 
-本次只转发数据，不接收 VOFA 调参命令，也不支持 Gateway 模式。固件本地 PID 和 PWM 保持原有约 200Hz，不修改增益、平滑、推力上限或电机方向。
+### VOFA 手动改参
+
+需要烧录支持 `CMD PID YAW` 的新版固件；上面的 `--vofa` 命令同时启用曲线和调参，不新增运行入口。
+
+VOFA 仍选择 UDP/FireWater，设置为：
+
+| 配置项 | 值 |
+| --- | --- |
+| 远程 IP | `127.0.0.1` |
+| 远程端口（Controller 接收命令） | `1346` |
+| 本地端口（VOFA 接收曲线与回执） | `1347` |
+
+命令设置保持 **Abc / Str** 文本模式，发送内容不要只填 `Kp`。四个命令分别填下面的模板，末尾的 `\r\n` 也要输入，不加引号；VOFA 会将其转成实际行尾：
+
+| 名称 | 发送内容 | 滑块软件范围 | 初始值 |
+| --- | --- | --- | --- |
+| yaw外环Kp | `CMD PID YAW ANGLE_KP %.6f\r\n` | `0~10` | `2` |
+| yaw内环Kp | `CMD PID YAW RATE_KP %.6f\r\n` | `0~1` | `0.02` |
+| yaw内环Ki | `CMD PID YAW RATE_KI %.6f\r\n` | `0~1` | `0` |
+| yaw内环Kd | `CMD PID YAW RATE_KD %.6f\r\n` | `0~0.1` | `0` |
+
+占位符接收绑定控件的浮点值，见[官方命令/参数说明](https://www.vofa.plus/docs/learning/start/data_cmd_parameter/)。先使用单次发送，不开启连续发送。上下限只是防误输入的软件边界，不是水下安全增益或推荐整定范围；先断开推进器动力验收链路。
+
+调参流程：先确认 Controller 显示 **MANUAL**，修改滑块并发送；例如实际发出的文本应为 `CMD PID YAW RATE_KP 0.030000` 加换行，而不是原样的 `%f`。Controller 只接收这四类参数命令，不会转发 VOFA 发来的 MODE、LIMIT 或其他任意串口文本。
+
+Teensy 返回后，完整面板在 `PID{}` 后显示最新一条：
+
+```text
+PARAM{status=OK angle_kp=2.000000 rate_kp=0.030000 rate_ki=0.000000 rate_kd=0.000000}
+```
+
+`status=OK` 且四个实际值符合预期才算修改成功；`MODE_REJECTED` 表示处于自稳或已请求自稳，参数未改。非法/超范围命令由 Controller 显示 `INFO{vofa_command=rejected ...}`；直接经串口发送的非法命令只增加固件 `rx_rejected`。
+
+参数不作为第五条曲线：回执只随调参事件发送，面板重复显示缓存，不重复发包。USB 暂时不可写时固件保留一份最新待发结果；VOFA UDP 回执不保证送达，未看到新回执可手动重发相同设定确认，不自动重试。固件启动的 `SYS{ready=1}` 会清除 Controller 的旧 PARAM 缓存。
+
+确认后再按 R1 进入自稳测试。运行参数仅保存在 RAM，重启恢复 `Config.h` 默认值；不修改原有 200Hz 控制/PWM、推力上限、平滑或电机方向。调参目前不支持 Gateway 模式。
+
+端口有冲突时可使用 `--vofa-command-port` 修改 Controller 命令监听端口，同时修改 VOFA 远程端口；`--vofa-port` 修改的是 VOFA 本地端口，两者不能相同。
 
 ## Gateway 模式
 
@@ -117,8 +154,9 @@ uv run python ds5_teensy_demo.py \
 | `--render-hz` | `50` | 状态面板刷新频率 |
 | `--deadzone` | `0.08` | 摇杆死区 |
 | `--log-file` | 空 | 将收到的回显追加到文件 |
-| `--vofa` | 关闭 | 串口模式下转发四通道偏航数据 |
+| `--vofa` | 关闭 | 串口模式下转发偏航数据并接收四类调参命令 |
 | `--vofa-port` | `1347` | 本机 VOFA 的 UDP 监听端口 |
+| `--vofa-command-port` | `1346` | Controller 的本机 UDP 命令监听端口 |
 
 查看全部参数：
 

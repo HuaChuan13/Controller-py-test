@@ -21,7 +21,8 @@
 ```text
 串口调试：
 DS5 -> Controller -> USB/PKT -> Teensy
-Teensy -> Controller -> UDP/FireWater :1347 -> 本机 VOFA（可选、只读）
+Teensy -> Controller -> UDP/FireWater :1347 -> 本机 VOFA（可选）
+VOFA -> UDP :1346 -> Controller -> USB/CMD PID YAW -> Teensy
 
 三层联调：
 DS5 -> Controller -> UDP/PKT :14550 -> Jetson rov_gateway
@@ -45,17 +46,20 @@ DS5 -> Controller -> UDP/PKT :14550 -> Jetson rov_gateway
 - 可选文本日志。
 - Windows 串口打开超时和串口写入超时保护。
 - 串口模式 `--vofa`：逐条转发独立 `PID{}` 四通道小帧，随固件有效新样本约 200Hz；完整回显和面板仍为 50Hz。
+- 复用同一非阻塞UDP socket在本机1346接收yaw四类增益命令，Teensy仅允许MANUAL改参；PARAM回执进入面板和VOFA文字区，不增加曲线通道。
 - 串口每轮最多读取4096字节，换行前文本最多4096字符（固件为ASCII）。完整行超长时整行丢弃；半行超长后持续丢弃到换行，避免把坏行尾部当作新记录。
 
 固定面板标签：
 
 ```text
-SYS DS5 CTRL MIX PWM SHT40 PM08 DEPTH IMU PID
+SYS DS5 CTRL MIX PWM SHT40 PM08 DEPTH IMU PID PARAM
 ```
 
 Gateway 模式额外显示 `GATEWAY`；无标签信息使用 `INFO` 显示。
 
 PID尚未收到时显示`PID{waiting}`，之后保存最后一条。切回手动或反馈故障后固件停止PID输出，面板不会清零，需结合实际模式和反馈状态判断有效性；不加`--vofa`也可显示收到的PID行。此显示调整不改变Teensy固件、串口数据和VOFA发送路径。
+
+PARAM在PID之后显示最新事件回执；未收到时为`PARAM{waiting}`，不按面板频率重发。`SYS{ready=1}`清除旧PARAM缓存，因为固件重启会恢复默认增益。滑块只是拟发送值，必须检查新回执的status和四个实际参数。
 
 面板中的IMU仅在绘制时解析，温度/角度保留2位小数，加速度/角速度保留3位小数；每个数值占9字符，缺失为`---`、无效为`ERR`、超宽为`OVF`。三轴行固定64字符，未收到IMU时也保留四行占位。VOFA另从原始遥测解析所需字段，不读取面板格式化结果。
 
@@ -78,7 +82,7 @@ ACC/GYR/ANG只是显示分组，对应固件原有IMU标签；这项排版本身
 ### 未实现
 
 - 正式产品 UI、任务控制、参数配置和自建数据可视化界面；当前绘图复用外部 VOFA。
-- VOFA 调参命令、Gateway 到 VOFA 转发、其余三个闭环轴的通道。
+- Gateway 到 VOFA 转发、其余三个闭环轴的通道和调参、参数持久化。
 - 串口掉线后的自动重连。
 - 多 Gateway 控制端仲裁。
 - 带真实 Gateway、Teensy 和 DS5 的自动化集成测试。
@@ -124,13 +128,15 @@ Controller/
 | 串口读取超时 | 1ms |
 | 串口打开后等待 | 2.0s |
 | VOFA（默认关闭） | 本机 `127.0.0.1:1347`，UDP/FireWater，随有效 PID 样本约 200Hz |
+| Controller命令监听 | `127.0.0.1:1346`，只允许配置的VOFA本地端口发来命令，每轮最多1个数据报 |
 | 串口单次接收预算 / 行文本上限 | 4096字节 / 4096字符（ASCII时等同字节数） |
 
 串口循环：
 
 ```text
 读取现有串口数据 -> 更新标签缓存 -> 读取DS5
--> 到期时发送PKT -> 可选转发VOFA -> 到期时重绘面板 -> sleep 1ms
+-> 到期时优先发送PKT -> 可选转发VOFA、接收1条调参命令并串行写CMD
+-> 到期时重绘面板 -> sleep 1ms
 ```
 
 Gateway 循环结构相同，但使用非阻塞 UDP socket，每轮最多处理 32 个数据报。Windows 上 socket 必须先绑定本地临时端口，Gateway 才能把标签行回传到正确源端口。
@@ -170,7 +176,7 @@ Gateway 当前按最后一个合法 PC 地址回传文本，因此 Python Contro
 
 ### VOFA 本机 UDP
 
-- 仅串口模式通过 `--vofa` 开启；`--vofa-port` 默认 1347。不能与 Gateway 或 `--ds5-debug` 组合。
+- 仅串口模式通过 `--vofa` 开启；`--vofa-port` 默认1347，`--vofa-command-port` 默认1346，均须为1~65535且不能相同。不能与Gateway或`--ds5-debug`组合。
 - Controller 独占 Teensy 串口，VOFA 只监听本机 UDP，不打开 COM8。
 - 使用 [FireWater](https://www.vofa.plus/docs/learning/dataengines/firewater/)：一个数据报一行 CSV，以 `\n` 结束。例如 `yaw:110.09,112.09,-4,-0.031\n`。
 - 数据源改为一条完整记录：`PID{yaw_sp=110.09 yaw_deg=112.09 rate_sp=-4.00 gz_dps=-0.031}`。四通道顺序为yaw_sp、yaw_deg、rate_sp、gz_dps，前两个单位deg，后两个deg/s。需要配套新版固件，旧版CTRL/SYS/IMU拼帧路径已删除。
@@ -179,6 +185,23 @@ Gateway 当前按最后一个合法 PC 地址回传文本，因此 Python Contro
 - 约200Hz来自固件200Hz新IMU样本，不是电脑定时重复发送。当前四通道记录无采样时间戳，USB积压可能产生批量到达，PC不能严格识别样本年龄；精确延迟分析需再扩展协议。
 - UDP 非阻塞发送，失败只丢绘图帧，不重试、不阻断手柄发包。socket 创建失败时显示 `INFO{vofa=disabled ...}`，继续原有串口控制。
 - PID行进入日志和最新值缓存，面板50Hz显示最新一条，VOFA仍逐样本转发约200Hz；绘制面板不会重新发送PID。PKT格式、手柄映射、滤波和PID运算不变。
+
+### VOFA 调参命令
+
+复用`VofaBridge`同一个UDP socket：绑定127.0.0.1:1346，只接受配置的VOFA源端口（默认1347）。每轮最多取一个不超过128字节的数据报，只允许一条ASCII命令：
+
+```text
+CMD PID YAW ANGLE_KP <0~10>
+CMD PID YAW RATE_KP <0~1>
+CMD PID YAW RATE_KI <0~1>
+CMD PID YAW RATE_KD <0~0.1>
+```
+
+Controller校验长度、单行、白名单和有限数值范围，规范化后补一个LF，与PKT在同一线程写COM8；PKT先发。无线程、历史命令队列或自动重试，不允许透传MODE/LIMIT等命令。UDP/格式错误只显示INFO，串口写超时仍终止控制会话。
+
+固件再次校验，且current/requested都必须MANUAL。成功返回`PARAM{status=OK angle_kp=... rate_kp=... rate_ki=... rate_kd=...}`；模式拒绝返回MODE_REJECTED和未变的实际值。控制器不根据50Hz面板缓存代替固件判定模式。软件上限不代表已整定的水下安全参数。
+
+PARAM作为文字原样转发至VOFA，不进入FireWater四条曲线。固件只在事件后回传，USB忙时保留一份最新结果，批量操作可合并为最终四值；UDP可能丢失，未收到新回执不能宣称生效，可手动重复同一设定确认。运行参数在RAM，重启恢复默认值。VOFA的Abc模板、滑块配置及逐步操作见README，暂不增加GET、持久化、自动回填滑块或运行中改参。
 
 ## 6. 环境与命令
 
@@ -248,7 +271,7 @@ uv run python ds5_teensy_demo.py --help
 6. 烧录配套PID小帧固件，加 `--send-hz 200 --vofa`，按 R1 请求自稳；确认实际模式和IMU有效，VOFA四通道与PID字段一致，角度与角速度分别绘图。临时统计一段时间的PID记录和UDP接收数，确认接近200组/秒；不能仅看面板标题判断实际帧率。
 7. 切回 MANUAL 或 IMU 掉线后应停止转发；恢复有效自稳后重新出现曲线。停止 VOFA 不应中断 Controller 手柄控制。
 
-当前14项测试覆盖raw Gateway、IMU排版、缓存日志原样保留，以及PID四通道编码、坏行拒绝、串口分段拼接、4096字节接收预算和行文本上限。超长行尾部即使包含合法PID格式也不会进入面板、日志或VOFA；空读保留丢弃状态，遇到换行后恢复，完整超长行同样丢弃。混合200个不同PID样本与50份完整快照后保持全部200帧，面板显示最新PID，未收到时占位、无新数据保留最后值；真实UDP回环验证50批、每批4帧共200帧，UDP发送/创建失败仍继续原始PKT发送，面板维持独立周期。unittest、compileall和--help通过；以上是软件检查，不是实机200Hz时序测量，VOFA界面、DS5、Teensy和Gateway仍需实机验证。
+当前18项测试覆盖raw Gateway、IMU排版、缓存日志原样保留、PID四通道、串口坏行与恢复，以及双向UDP、调参白名单/范围、源端口/数据报预算、PKT优先交错写入、PARAM缓存/重启失效和写超时。混合200个PID样本与50份完整快照及200帧UDP回环仍通过，UDP发送/创建失败不终止手柄发包。unittest、compileall和--help通过；以上是软件检查，不是实机200Hz时序测量，VOFA界面、DS5、Teensy和Gateway仍需实机验证。
 
 ## 8. 已知问题与排查
 
@@ -262,6 +285,7 @@ uv run python ds5_teensy_demo.py --help
 | Gateway 无回包 | Jetson 地址/端口、防火墙、Gateway 是否运行及 UDP 源端口绑定 |
 | VOFA 没有曲线 | 是否加 `--vofa`、本地端口是否一致、协议是否FireWater、是否有效STABILIZE、新固件是否输出独立PID行；旧版CTRL/IMU不再转发 |
 | VOFA 曲线停住 | MANUAL、IMU 掉线或没有新快照时主动停止转发，不代表手柄控制已停止 |
+| VOFA 参数不变 | 远程1346/本地1347、Abc模板是否发送实际值和换行、是否MANUAL、INFO/PARAM状态；不能以滑块数字代替固件确认 |
 | Linux 扳机静止为 0.5 | SDL 轴初值或映射不同，先用 `--ds5-debug` 记录 raw 值 |
 
 当前串口每轮最多读4096字节，完整行和未结束行均检查4096字符上限；超长半行持续丢弃到下一个换行，不把尾部重新作为记录。Gateway每轮最多接收32个数据报。预算只限制处理量，不保证持续洪泛下不丢数据，也不保证Windows调度周期；没有自动清空USB积压或无损历史队列。

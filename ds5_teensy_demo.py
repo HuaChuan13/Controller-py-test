@@ -30,6 +30,9 @@ DEFAULT_SERIAL_WRITE_TIMEOUT_S = 0.5
 MAX_GATEWAY_DATAGRAMS_PER_LOOP = 32
 MAX_SERIAL_READ_BYTES = 4096  # 限制每轮接收量，避免积压处理拖住手柄发包
 DEFAULT_VOFA_PORT = 1347
+DEFAULT_VOFA_COMMAND_PORT = 1346
+MAX_VOFA_COMMAND_BYTES = 128
+VOFA_YAW_GAIN_LIMITS = {"ANGLE_KP": 10.0, "RATE_KP": 1.0, "RATE_KI": 1.0, "RATE_KD": 0.1}
 VOFA_YAW_FIELDS = (
     "yaw_sp",   # 期望偏航角，单位 deg
     "yaw_deg",  # 实际偏航角，单位 deg
@@ -47,6 +50,7 @@ DISPLAY_TAGS = [
     "DEPTH",
     "IMU",
     "PID",
+    "PARAM",
 ]
 IMU_ROWS = (
     ("IMU", ("temp_c",), 2),
@@ -93,10 +97,14 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--vofa",
         action="store_true",
-        help="Forward yaw telemetry to VOFA via local UDP (serial mode only)",
+        help="Bridge yaw telemetry and manual gain commands with local VOFA (serial mode only)",
     )
     parser.add_argument(
         "--vofa-port", type=int, default=DEFAULT_VOFA_PORT, help="VOFA UDP listening port"
+    )
+    parser.add_argument(
+        "--vofa-command-port", type=int, default=DEFAULT_VOFA_COMMAND_PORT,
+        help="Local UDP port receiving VOFA yaw gain commands",
     )
     return parser
 
@@ -247,6 +255,8 @@ def update_panel_state(
     lines: list[str], panel_state: dict[str, str], log_file: TextIO | None
 ) -> None:
     for line in lines:
+        if line == "SYS{ready=1}":
+            panel_state.pop("PARAM", None)  # 固件重启恢复默认值，不能沿用旧参数确认
         text = f"[Teensy] {line}"
         if log_file is not None:
             log_file.write(text + "\n")
@@ -272,17 +282,52 @@ def build_vofa_yaw_frame(line: str) -> bytes | None:
     return ("yaw:" + ",".join(f"{value:.9g}" for value in values) + "\n").encode("ascii")
 
 
-class VofaYawSender:
-    def __init__(self, port: int) -> None:
+def normalize_vofa_command(data: bytes) -> bytes:
+    if not data or len(data) > MAX_VOFA_COMMAND_BYTES:
+        raise ValueError("command must contain 1..128 bytes")
+    text = data.decode("ascii").strip()
+    fields = text.split()
+    if "\n" in text or "\r" in text or len(fields) != 5 or fields[:3] != ["CMD", "PID", "YAW"]:
+        raise ValueError("expected one CMD PID YAW <gain> <value> line")
+    gain = fields[3]
+    value = float(fields[4])
+    if (gain not in VOFA_YAW_GAIN_LIMITS or not math.isfinite(value)
+            or not 0 <= value <= VOFA_YAW_GAIN_LIMITS[gain]):
+        raise ValueError("unknown yaw gain or value outside its allowed range")
+    return f"CMD PID YAW {gain} {value:.9g}\n".encode("ascii")
+
+
+class VofaBridge:
+    def __init__(self, port: int, command_port: int = DEFAULT_VOFA_COMMAND_PORT) -> None:
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.socket.setblocking(False)
+        try:
+            self.socket.bind(("127.0.0.1", command_port))
+            self.socket.setblocking(False)
+        except OSError:
+            self.socket.close()
+            raise
         self.target = ("127.0.0.1", port)
+
+    def read_command(self) -> bytes | None:
+        # 每轮只读一个数据报；只接收已配置的本机 VOFA 端口，不开放任意命令透传。
+        try:
+            data, source = self.socket.recvfrom(MAX_VOFA_COMMAND_BYTES + 1)
+        except BlockingIOError:
+            return None
+        if source != self.target:
+            return None
+        return normalize_vofa_command(data)
 
     def update(self, lines: list[str]) -> None:
         # 每个完整 PID 样本转发一次，不按面板频率限速或合并样本。
         # ponytail: 四通道帧不含时间戳，严格识别 USB 积压时再扩展采样时间。
         for line in lines:
             frame = build_vofa_yaw_frame(line)
+            if line.startswith("PARAM{") and line.endswith("}"):
+                try:
+                    frame = (line + "\n").encode("ascii")
+                except UnicodeEncodeError:
+                    continue
             if frame is None:
                 continue
             try:
@@ -292,6 +337,13 @@ class VofaYawSender:
 
     def close(self) -> None:
         self.socket.close()
+
+
+def write_serial_data(serial_port: serial.Serial, data: bytes, port_name: str) -> None:
+    try:
+        serial_port.write(data)
+    except serial.SerialTimeoutException as exc:
+        raise RuntimeError(f"Serial write to {port_name} timed out") from exc
 
 
 def format_imu_lines(line: str) -> list[str]:
@@ -448,7 +500,7 @@ def run_serial_demo(
     log_file: TextIO | None,
 ) -> int:
     serial_port: serial.Serial | None = None
-    vofa: VofaYawSender | None = None
+    vofa: VofaBridge | None = None
     sequence = 0
     read_buffer: str | None = ""
     last_send = 0.0
@@ -458,7 +510,7 @@ def run_serial_demo(
     try:
         if args.vofa:
             try:
-                vofa = VofaYawSender(args.vofa_port)
+                vofa = VofaBridge(args.vofa_port, args.vofa_command_port)
             except OSError as exc:
                 panel_state["INFO"] = f"INFO{{vofa=disabled error={exc}}}"
         joystick_name = ds5_reader.open()
@@ -485,20 +537,21 @@ def run_serial_demo(
 
             if now - last_send >= 1.0 / args.send_hz:
                 sequence += 1
-                try:
-                    serial_port.write(
-                        (build_packet_line(sequence, joystick_snapshot) + "\n").encode(
-                            "utf-8"
-                        )
-                    )
-                except serial.SerialTimeoutException as exc:
-                    raise RuntimeError(
-                        f"Serial write to {args.teensy_port} timed out"
-                    ) from exc
+                write_serial_data(
+                    serial_port, (build_packet_line(sequence, joystick_snapshot) + "\n").encode("ascii"),
+                    args.teensy_port,
+                )
                 last_send = now
 
             if vofa is not None:
                 vofa.update(lines)
+                try:
+                    command = vofa.read_command()
+                except (ValueError, OSError) as exc:
+                    panel_state["INFO"] = f"INFO{{vofa_command=rejected error={exc}}}"
+                else:
+                    if command is not None:
+                        write_serial_data(serial_port, command, args.teensy_port)
 
             if now - last_render >= 1.0 / args.render_hz:
                 render_panel(
@@ -586,6 +639,10 @@ def main() -> int:
     args = parser.parse_args()
     if not 1 <= args.vofa_port <= 65535:
         parser.error("--vofa-port must be between 1 and 65535")
+    if not 1 <= args.vofa_command_port <= 65535:
+        parser.error("--vofa-command-port must be between 1 and 65535")
+    if args.vofa and args.vofa_command_port == args.vofa_port:
+        parser.error("VOFA receive and command ports must differ")
     if args.vofa and (args.mode != "serial" or args.ds5_debug):
         parser.error("--vofa requires serial mode without --ds5-debug")
 
