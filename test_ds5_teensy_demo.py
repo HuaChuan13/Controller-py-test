@@ -161,10 +161,57 @@ class VofaTests(unittest.TestCase):
         self.assertEqual(lines, [])
         self.assertEqual(len(buffer), 4096)
         lines, buffer = read_available_lines(port, buffer)
-        self.assertEqual((lines, buffer), ([], ""))
+        self.assertEqual((lines, buffer), ([], None))
+        port.in_waiting = 0
+        self.assertEqual(read_available_lines(port, buffer), ([], None))
+        port.in_waiting = 4096
+        port.read.return_value = self.line.encode()
+        lines, buffer = read_available_lines(port, buffer)
+        self.assertEqual((lines, buffer), ([], None))
         port.read.return_value = ("\n" + self.line + "\n").encode()
         lines, buffer = read_available_lines(port, buffer)
         self.assertEqual((lines, buffer), ([self.line], ""))
+
+    def test_complete_serial_lines_obey_length_limit(self) -> None:
+        for length in (4095, 4096, 4097, 5042):
+            with self.subTest(length=length):
+                oversized = self.line[:-1] + " " * (length - len(self.line)) + "}"
+                stream = io.BytesIO((oversized + "\r\n" + self.line + "\r\n").encode())
+                port = Mock()
+                port.read.side_effect = stream.read
+                buffer = ""
+                received = []
+                while stream.tell() < len(stream.getvalue()):
+                    port.in_waiting = len(stream.getvalue()) - stream.tell()
+                    rows, buffer = read_available_lines(port, buffer)
+                    received.extend(rows)
+                # CR before LF counts toward the raw line length limit.
+                expected = [oversized, self.line] if length + 1 <= 4096 else [self.line]
+                self.assertEqual(received, expected)
+                self.assertEqual(buffer, "")
+
+    def test_overlong_record_tail_never_reaches_panel_log_or_vofa(self) -> None:
+        valid = self.line.replace("112.09", "113")
+        stream = io.BytesIO(b"x" * 8192 + (self.line + "\r\n" + valid + "\r\n").encode())
+        port = Mock()
+        port.read.side_effect = stream.read
+        buffer = ""
+        panel = {}
+        log = io.StringIO()
+        with patch("ds5_teensy_demo.socket.socket") as factory:
+            sender = VofaYawSender(1347)
+        while stream.tell() < len(stream.getvalue()):
+            port.in_waiting = len(stream.getvalue()) - stream.tell()
+            rows, buffer = read_available_lines(port, buffer)
+            update_panel_state(rows, panel, log)
+            sender.update(rows)
+        self.assertEqual(panel, {"PID": valid})
+        self.assertEqual(log.getvalue(), f"[Teensy] {valid}\n")
+        factory.return_value.sendto.assert_called_once_with(
+            build_vofa_yaw_frame(valid), ("127.0.0.1", 1347)
+        )
+        self.assertEqual(buffer, "")
+        sender.close()
 
     def test_udp_loopback_receives_all_four_samples_per_batch(self) -> None:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as receiver:

@@ -36,17 +36,6 @@ VOFA_YAW_FIELDS = (
     "rate_sp",  # 期望偏航角速度，单位 deg/s
     "gz_dps",   # 实际偏航角速度，单位 deg/s
 )
-# DISPLAY_TAGS = [
-#     "CTRL",
-#     "SYS",
-#     "DS5",
-#     "MIX",
-#     "PWM",
-#     "SHT40",
-#     "PM08",
-#     "DEPTH",
-#     "IMU",
-# ]
 DISPLAY_TAGS = [
     "SYS",
     "DS5",
@@ -127,26 +116,34 @@ def build_packet_line(sequence: int, joystick: JoystickSnapshot) -> str:
 
 
 def read_available_lines(
-    serial_port: serial.Serial, read_buffer: str
-) -> tuple[list[str], str]:
+    serial_port: serial.Serial, read_buffer: str | None
+) -> tuple[list[str], str | None]:
     if not serial_port.in_waiting:
         return [], read_buffer
 
     data = serial_port.read(min(serial_port.in_waiting, MAX_SERIAL_READ_BYTES)).decode(
         "utf-8", errors="replace"
     )
+    # None 表示超长行尚未结束，必须丢弃到换行后才能重新接收。
+    if read_buffer is None:
+        _, newline, data = data.partition("\n")
+        if not newline:
+            return [], None
+        read_buffer = ""
     read_buffer += data
 
     lines: list[str] = []
     while "\n" in read_buffer:
         line, read_buffer = read_buffer.split("\n", 1)
+        if len(line) > MAX_SERIAL_READ_BYTES:
+            continue
         stripped = line.strip()
         if stripped:
             lines.append(stripped)
 
-    # 固件正常单行小于 1024 字节，超长未结束行不继续占用接收缓存。
+    # 固件为 ASCII；正常单行小于 1024 字节，超长后不再保留正文。
     if len(read_buffer) > MAX_SERIAL_READ_BYTES:
-        read_buffer = ""
+        read_buffer = None
     return lines, read_buffer
 
 
@@ -453,7 +450,7 @@ def run_serial_demo(
     serial_port: serial.Serial | None = None
     vofa: VofaYawSender | None = None
     sequence = 0
-    read_buffer = ""
+    read_buffer: str | None = ""
     last_send = 0.0
     last_render = 0.0
     panel_state: dict[str, str] = {}
