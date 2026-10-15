@@ -89,7 +89,7 @@ VOFA 仍选择 UDP/FireWater，设置为：
 
 命令设置保持 **Abc / Str** 文本模式，发送内容不要只填 `Kp`。四个命令分别填下面的模板，末尾的 `\r\n` 也要输入，不加引号；VOFA 会将其转成实际行尾：
 
-| 名称 | 发送内容 | 滑块软件范围 | 初始值 |
+| 名称 | 发送内容 | 滑块范围（固件默认配置） | 初始值 |
 | --- | --- | --- | --- |
 | yaw外环Kp | `CMD PID YAW ANGLE_KP %.6f\r\n` | `0~10` | `2` |
 | yaw内环Kp | `CMD PID YAW RATE_KP %.6f\r\n` | `0~1` | `0.02` |
@@ -97,6 +97,8 @@ VOFA 仍选择 UDP/FireWater，设置为：
 | yaw内环Kd | `CMD PID YAW RATE_KD %.6f\r\n` | `0~0.1` | `0` |
 
 占位符接收绑定控件的浮点值，见[官方命令/参数说明](https://www.vofa.plus/docs/learning/start/data_cmd_parameter/)。先使用单次发送，不开启连续发送。上下限只是防误输入的软件边界，不是水下安全增益或推荐整定范围；先断开推进器动力验收链路。
+
+四个上限只在Teensy项目的`lib/core/Config.h`维护：`kYawAngleKpMax`、`kYawRateKpMax`、`kYawRateKiMax`、`kYawRateKdMax`。按需修改、重新编译烧录，并调整VOFA滑块范围即可；Controller不再维护同一组上限，只检查白名单、单行和有限非负数。
 
 调参流程：先确认 Controller 显示 **MANUAL**，修改滑块并发送；例如实际发出的文本应为 `CMD PID YAW RATE_KP 0.030000` 加换行，而不是原样的 `%f`。Controller 只接收这四类参数命令，不会转发 VOFA 发来的 MODE、LIMIT 或其他任意串口文本。
 
@@ -106,7 +108,7 @@ Teensy 返回后，完整面板在 `PID{}` 后显示最新一条：
 PARAM{status=OK angle_kp=2.000000 rate_kp=0.030000 rate_ki=0.000000 rate_kd=0.000000}
 ```
 
-`status=OK` 且四个实际值符合预期才算修改成功；`MODE_REJECTED` 表示处于自稳或已请求自稳，参数未改。非法/超范围命令由 Controller 显示 `INFO{vofa_command=rejected ...}`；直接经串口发送的非法命令只增加固件 `rx_rejected`。
+`status=OK` 且四个实际值符合预期才算修改成功；`MODE_REJECTED` 表示处于自稳或已请求自稳，参数未改。非法格式、未知参数、负数或非有限数由Controller显示`INFO{vofa_command=rejected ...}`。超过Config.h上限的命令会转发，但固件只增加`SYS{rx_rejected}`，不产生新PARAM；旧PARAM缓存不能作为本次修改成功的确认。
 
 参数不作为第五条曲线：回执只随调参事件发送，面板重复显示缓存，不重复发包。USB 暂时不可写时固件保留一份最新待发结果；VOFA UDP 回执不保证送达，未看到新回执可手动重发相同设定确认，不自动重试。固件启动的 `SYS{ready=1}` 会清除 Controller 的旧 PARAM 缓存。
 

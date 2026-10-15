@@ -236,12 +236,13 @@ class VofaTests(unittest.TestCase):
             finally:
                 sender.close()
 
-    def test_yaw_command_whitelist_ranges_and_line_framing(self) -> None:
-        for gain, maximum in (("ANGLE_KP", 10), ("RATE_KP", 1), ("RATE_KI", 1), ("RATE_KD", 0.1)):
-            for value in (0, maximum):
+    def test_yaw_command_whitelist_values_and_line_framing(self) -> None:
+        for gain, old_maximum in (("ANGLE_KP", 10), ("RATE_KP", 1), ("RATE_KI", 1), ("RATE_KD", 0.1)):
+            # PC 不拦截旧上限以上的有限非负数；可调边界由固件决定。
+            for value in (0, old_maximum, old_maximum + 1, 1.1e99):
                 command = f"CMD PID YAW {gain} {value}\r\n".encode()
                 self.assertEqual(normalize_vofa_command(command), f"CMD PID YAW {gain} {value:.9g}\n".encode())
-            for value in ("-1", "nan", "inf", "%f", "1.1e99", str(maximum + 1)):
+            for value in ("-1", "nan", "inf", "-inf", "%f", "1e999"):
                 with self.subTest(gain=gain, value=value), self.assertRaises(ValueError):
                     normalize_vofa_command(f"CMD PID YAW {gain} {value}\n".encode())
         for command in (
@@ -315,14 +316,14 @@ class VofaTests(unittest.TestCase):
             redirect_stdout(io.StringIO()),
         ):
             factory.return_value.recvfrom.side_effect = [
-                (b"CMD PID YAW RATE_KP 0.03\r\n", ("127.0.0.1", 1347)),
+                (b"CMD PID YAW RATE_KP 2\r\n", ("127.0.0.1", 1347)),
                 (b"CMD MODE STABILIZE\n", ("127.0.0.1", 1347)),
                 (b"CMD PID YAW RATE_KI 0.01\r\n", ("127.0.0.1", 1347)),
             ]
             self.assertEqual(run_serial_demo(args, reader, None), 0)
         sent = [call.args[0] for call in port.write.call_args_list]
         self.assertEqual([data.split()[0] for data in sent], [b"PKT", b"CMD", b"PKT", b"PKT", b"CMD"])
-        self.assertEqual(sent[1], b"CMD PID YAW RATE_KP 0.03\n")
+        self.assertEqual(sent[1], b"CMD PID YAW RATE_KP 2\n")
         self.assertEqual(sent[-1], b"CMD PID YAW RATE_KI 0.01\n")
         self.assertIn("vofa_command=rejected", " ".join(render.call_args.args[0]))
         port.close.assert_called_once()

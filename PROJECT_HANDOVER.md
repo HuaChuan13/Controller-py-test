@@ -191,15 +191,15 @@ Gateway 当前按最后一个合法 PC 地址回传文本，因此 Python Contro
 复用`VofaBridge`同一个UDP socket：绑定127.0.0.1:1346，只接受配置的VOFA源端口（默认1347）。每轮最多取一个不超过128字节的数据报，只允许一条ASCII命令：
 
 ```text
-CMD PID YAW ANGLE_KP <0~10>
-CMD PID YAW RATE_KP <0~1>
-CMD PID YAW RATE_KI <0~1>
-CMD PID YAW RATE_KD <0~0.1>
+CMD PID YAW ANGLE_KP <value>
+CMD PID YAW RATE_KP <value>
+CMD PID YAW RATE_KI <value>
+CMD PID YAW RATE_KD <value>
 ```
 
-Controller校验长度、单行、白名单和有限数值范围，规范化后补一个LF，与PKT在同一线程写COM8；PKT先发。无线程、历史命令队列或自动重试，不允许透传MODE/LIMIT等命令。UDP/格式错误只显示INFO，串口写超时仍终止控制会话。
+Controller校验长度、单行、白名单和有限非负数，规范化后补一个LF，与PKT在同一线程写COM8；PKT先发。无线程、历史命令队列或自动重试，不允许透传MODE/LIMIT等命令。UDP/格式错误只显示INFO，串口写超时仍终止控制会话。
 
-固件再次校验，且current/requested都必须MANUAL。成功返回`PARAM{status=OK angle_kp=... rate_kp=... rate_ki=... rate_kd=...}`；模式拒绝返回MODE_REJECTED和未变的实际值。控制器不根据50Hz面板缓存代替固件判定模式。软件上限不代表已整定的水下安全参数。
+固件再次校验，且current/requested都必须MANUAL。四个上限只在Teensy Config.h的kYawAngleKpMax/kYawRateKpMax/kYawRateKiMax/kYawRateKdMax维护，改动后重新编译烧录、匹配VOFA滑块，不需要改Controller。成功返回`PARAM{status=OK angle_kp=... rate_kp=... rate_ki=... rate_kd=...}`；模式拒绝返回MODE_REJECTED和未变的实际值。超过固件上限只增加rx_rejected，不产生新PARAM，旧回执不代表本次成功。控制器不根据50Hz面板缓存代替固件判定模式；软件上限不代表已整定的水下安全参数。
 
 PARAM作为文字原样转发至VOFA，不进入FireWater四条曲线。固件只在事件后回传，USB忙时保留一份最新结果，批量操作可合并为最终四值；UDP可能丢失，未收到新回执不能宣称生效，可手动重复同一设定确认。运行参数在RAM，重启恢复默认值。VOFA的Abc模板、滑块配置及逐步操作见README，暂不增加GET、持久化、自动回填滑块或运行中改参。
 
@@ -271,7 +271,7 @@ uv run python ds5_teensy_demo.py --help
 6. 烧录配套PID小帧固件，加 `--send-hz 200 --vofa`，按 R1 请求自稳；确认实际模式和IMU有效，VOFA四通道与PID字段一致，角度与角速度分别绘图。临时统计一段时间的PID记录和UDP接收数，确认接近200组/秒；不能仅看面板标题判断实际帧率。
 7. 切回 MANUAL 或 IMU 掉线后应停止转发；恢复有效自稳后重新出现曲线。停止 VOFA 不应中断 Controller 手柄控制。
 
-当前18项测试覆盖raw Gateway、IMU排版、缓存日志原样保留、PID四通道、串口坏行与恢复，以及双向UDP、调参白名单/范围、源端口/数据报预算、PKT优先交错写入、PARAM缓存/重启失效和写超时。混合200个PID样本与50份完整快照及200帧UDP回环仍通过，UDP发送/创建失败不终止手柄发包。unittest、compileall和--help通过；以上是软件检查，不是实机200Hz时序测量，VOFA界面、DS5、Teensy和Gateway仍需实机验证。
+当前18项测试覆盖raw Gateway、IMU排版、缓存日志原样保留、PID四通道、串口坏行与恢复，以及双向UDP、调参白名单/有限非负数、旧上限以上值转发、源端口/数据报预算、PKT优先交错写入、PARAM缓存/重启失效和写超时。混合200个PID样本与50份完整快照及200帧UDP回环仍通过，UDP发送/创建失败不终止手柄发包。unittest、compileall和--help通过；以上是软件检查，不是实机200Hz时序测量，VOFA界面、DS5、Teensy和Gateway仍需实机验证。
 
 ## 8. 已知问题与排查
 

@@ -32,7 +32,7 @@ MAX_SERIAL_READ_BYTES = 4096  # 限制每轮接收量，避免积压处理拖住
 DEFAULT_VOFA_PORT = 1347
 DEFAULT_VOFA_COMMAND_PORT = 1346
 MAX_VOFA_COMMAND_BYTES = 128
-VOFA_YAW_GAIN_LIMITS = {"ANGLE_KP": 10.0, "RATE_KP": 1.0, "RATE_KI": 1.0, "RATE_KD": 0.1}
+VOFA_YAW_GAINS = ("ANGLE_KP", "RATE_KP", "RATE_KI", "RATE_KD")
 VOFA_YAW_FIELDS = (
     "yaw_sp",   # 期望偏航角，单位 deg
     "yaw_deg",  # 实际偏航角，单位 deg
@@ -291,9 +291,9 @@ def normalize_vofa_command(data: bytes) -> bytes:
         raise ValueError("expected one CMD PID YAW <gain> <value> line")
     gain = fields[3]
     value = float(fields[4])
-    if (gain not in VOFA_YAW_GAIN_LIMITS or not math.isfinite(value)
-            or not 0 <= value <= VOFA_YAW_GAIN_LIMITS[gain]):
-        raise ValueError("unknown yaw gain or value outside its allowed range")
+    # 可调上限只由 Teensy Config.h 维护，避免 PC 与固件范围不一致。
+    if gain not in VOFA_YAW_GAINS or not math.isfinite(value) or value < 0:
+        raise ValueError("unknown yaw gain or value is not finite and nonnegative")
     return f"CMD PID YAW {gain} {value:.9g}\n".encode("ascii")
 
 
