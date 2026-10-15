@@ -51,6 +51,7 @@ DISPLAY_TAGS = [
     "SYS",
     "DS5",
     "CTRL",
+    "PID",
     "MIX",
     "PWM",
     "SHT40",

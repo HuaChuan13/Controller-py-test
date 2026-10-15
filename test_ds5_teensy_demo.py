@@ -55,7 +55,7 @@ class ImuPanelTests(unittest.TestCase):
         update_panel_state(received, state, log)
         original = dict(state)
         rows = build_panel_lines(state, 50, 50)
-        self.assertEqual(rows[2:10], received[:8])
+        self.assertEqual(rows[2:2 + len(DISPLAY_TAGS) - 1], received[:len(DISPLAY_TAGS) - 1])
         self.assertEqual(rows[-2:], received[-2:])
         self.assertEqual(state, original)
         self.assertEqual(log.getvalue(), "".join(f"[Teensy] {line}\n" for line in received))
@@ -126,7 +126,7 @@ class VofaTests(unittest.TestCase):
         for i in range(200):
             rows.append(self.line.replace("112.09", str(i)))
             if i % 4 == 0:
-                rows.extend(f"{tag}{{sample={i}}}" for tag in DISPLAY_TAGS)
+                rows.extend(f"{tag}{{sample={i}}}" for tag in DISPLAY_TAGS if tag != "PID")
         stream = io.BytesIO(("\n".join(rows) + "\n").encode())
         port = Mock()
         port.read.side_effect = stream.read
@@ -143,7 +143,11 @@ class VofaTests(unittest.TestCase):
         self.assertEqual(frames, [f"yaw:110.09,{i},-4,-0.031\n".encode() for i in range(200)])
         self.assertEqual(panel["SYS"], "SYS{sample=196}")
         self.assertTrue(all(call.args[0] <= 4096 for call in port.read.call_args_list))
-        self.assertFalse(any(row.startswith("PID{") for row in build_panel_lines(panel, 200, 50)))
+        latest = self.line.replace("112.09", "199")
+        self.assertIn(latest, build_panel_lines(panel, 200, 50))
+        self.assertIn("PID{waiting}", build_panel_lines({}, 200, 50))
+        update_panel_state([], panel, None)
+        self.assertIn(latest, build_panel_lines(panel, 200, 50))
         sender.update([])
         self.assertEqual(factory.return_value.sendto.call_count, 200)
 

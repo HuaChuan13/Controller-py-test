@@ -37,7 +37,7 @@ uv run python ds5_teensy_demo.py --mode serial --teensy-port COM8
 `COM8` 需要按实际 Teensy 端口修改。面板固定显示：
 
 ```text
-CTRL{} SYS{} DS5{} MIX{} PWM{} SHT40{} PM08{} DEPTH{} IMU{}
+SYS{} DS5{} CTRL{} PID{} MIX{} PWM{} SHT40{} PM08{} DEPTH{} IMU{}
 ```
 
 只有IMU在显示端拆成温度、加速度（ACC）、角速度（GYR）、角度（ANG）四行，三轴数值使用固定列宽；其余标签保持原始文本。ACC/GYR/ANG不是新增回传标签，原始日志和50Hz频率不变，无需重新烧录Teensy。
@@ -71,7 +71,9 @@ VOFA 选择 **UDP**，本地监听地址设为 `127.0.0.1`（或 `0.0.0.0`），
 
 上面的命令将手柄发包设为目标 200Hz；完整遥测和终端面板仍是 50Hz，VOFA 数据接收与面板刷新独立。默认不加 `--send-hz` 仍按 50Hz 发手柄，避免改变其他使用方式。USB/PC 延迟可能造成批量到达或丢帧，实际帧率需实机确认，不能把曲线点数当成精确采样时间。
 
-更换端口时使用 `--vofa-port 1348`，VOFA 的监听端口也改为同一个值。不加 `--vofa` 时不会创建 VOFA socket，原有面板和日志保持原样；`PID{}` 仅用于转发，不新增面板行。
+面板在 `CTRL{}` 后显示最新一条 `PID{}`，仍按50Hz刷新，不影响约200Hz的VOFA转发，也不增加Teensy串口数据。尚未收到时显示 `PID{waiting}`；手动或故障停止发送后保留最后值，需结合实际模式和反馈状态判断有效性。这项显示调整不需要重新烧录已支持PID小帧的固件。
+
+更换端口时使用 `--vofa-port 1348`，VOFA 的监听端口也改为同一个值。不加 `--vofa` 时不会创建 VOFA socket，但仍显示收到的PID行。
 
 本次只转发数据，不接收 VOFA 调参命令，也不支持 Gateway 模式。固件本地 PID 和 PWM 保持原有约 200Hz，不修改增益、平滑、推力上限或电机方向。
 
