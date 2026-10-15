@@ -14,6 +14,7 @@ from ds5_teensy_demo import (
     decode_gateway_line,
     main,
     read_available_gateway_lines,
+    read_available_lines,
     run_serial_demo,
     update_panel_state,
 )
@@ -86,93 +87,91 @@ class ImuPanelTests(unittest.TestCase):
 
 
 class VofaTests(unittest.TestCase):
-    lines = [
-        "CTRL{mode=STABILIZE action=FWD+CW yaw=-0.08 yaw_sp=110.09 rate_sp=-4.00}",
-        "SYS{pkt_alive=1 imu_alive=1}",
-        "IMU{temp_c=31 yaw_deg=112.09 gz_dps=-0.031}",
-    ]
+    line = "PID{yaw_sp=110.09 yaw_deg=112.09 rate_sp=-4.00 gz_dps=-0.031}"
     frame = b"yaw:110.09,112.09,-4,-0.031\n"
 
-    def test_four_channels_and_invalid_snapshots(self) -> None:
-        snapshot = dict(zip(("CTRL", "SYS", "IMU"), self.lines))
-        self.assertEqual(build_vofa_yaw_frame(snapshot), self.frame)
-        bad_lines = {
-            "CTRL": (
-                self.lines[0].replace("STABILIZE", "MANUAL"),
-                "CTRL{mode=STABILIZE rate_sp=1}",
-                self.lines[0][:-1],
-                "CTRL{mode=STABILIZE yaw_sp=nan rate_sp=1}",
-            ),
-            "SYS": ("SYS{imu_alive=0}", "SYS{ready=1}"),
-            "IMU": (
-                "IMU{yaw_deg=1}",
-                "IMU{yaw_deg=1 gz_dps=inf}",
-                "IMU{yaw_deg=1 gz_dps=bad}",
-                "IMU{yaw_deg=1 gz_dps=2 broken}",
-            ),
-        }
-        for tag, lines in bad_lines.items():
-            for line in lines:
-                with self.subTest(line=line):
-                    self.assertIsNone(build_vofa_yaw_frame({**snapshot, tag: line}))
-            self.assertIsNone(build_vofa_yaw_frame({k: v for k, v in snapshot.items() if k != tag}))
+    def test_four_channels_and_invalid_lines(self) -> None:
+        self.assertEqual(build_vofa_yaw_frame(self.line), self.frame)
+        for line in (
+            "CTRL{mode=STABILIZE yaw_sp=110 rate_sp=-4}",
+            "SYS{imu_alive=1}", "IMU{yaw_deg=112 gz_dps=0}",
+            self.line[:-1], self.line.replace("yaw_sp=110.09 ", ""),
+            self.line.replace("110.09", "nan"), self.line.replace("-4.00", "inf"),
+            self.line.replace("112.09", "broken"), self.line.replace("}", " broken}"),
+        ):
+            with self.subTest(line=line):
+                self.assertIsNone(build_vofa_yaw_frame(line))
 
-    def test_split_snapshot_does_not_mix_old_values(self) -> None:
+    def test_split_serial_line_is_forwarded_only_when_complete(self) -> None:
         with patch("ds5_teensy_demo.socket.socket") as factory:
             sender = VofaYawSender(1347)
         sock = factory.return_value
         sock.setblocking.assert_called_once_with(False)
-        sender.update(self.lines[:2], 0.0)
+        port = Mock(in_waiting=100)
+        port.read.side_effect = [self.line[:20].encode(), (self.line[20:] + "\r\n").encode()]
+        lines, buffer = read_available_lines(port, "")
+        sender.update(lines)
         sock.sendto.assert_not_called()
-        sender.update(["DS5{buttons=0}", self.lines[2]], 0.01)
+        lines, buffer = read_available_lines(port, buffer)
+        self.assertEqual(buffer, "")
+        sender.update(lines)
         sock.sendto.assert_called_once_with(self.frame, ("127.0.0.1", 1347))
-        sender.update([self.lines[2]], 0.04)
-        sender.update([self.lines[0], self.lines[2]], 0.06)
+        sender.update([])
         self.assertEqual(sock.sendto.call_count, 1)
         sender.close()
         sock.close.assert_called_once()
 
-    def test_rate_limit_keeps_only_latest_frame_and_never_replays(self) -> None:
+    def test_200_pid_samples_survive_50_full_snapshots_without_coalescing(self) -> None:
+        rows = []
+        for i in range(200):
+            rows.append(self.line.replace("112.09", str(i)))
+            if i % 4 == 0:
+                rows.extend(f"{tag}{{sample={i}}}" for tag in DISPLAY_TAGS)
+        stream = io.BytesIO(("\n".join(rows) + "\n").encode())
+        port = Mock()
+        port.read.side_effect = stream.read
+        panel = {}
+        buffer = ""
         with patch("ds5_teensy_demo.socket.socket") as factory:
             sender = VofaYawSender(1347)
-        sock = factory.return_value
-        sender.update(self.lines, 0.0)
-        sender.update(self.lines, 0.005)
-        latest = self.lines[:-1] + ["IMU{yaw_deg=113 gz_dps=2}"]
-        sender.update(latest, 0.01)
-        self.assertEqual(sock.sendto.call_count, 1)
-        sender.update([], 0.021)
-        self.assertEqual(sock.sendto.call_count, 2)
-        self.assertEqual(sock.sendto.call_args.args[0], b"yaw:110.09,113,-4,2\n")
-        sender.update([], 1.0)
-        self.assertEqual(sock.sendto.call_count, 2)
+        while stream.tell() < len(stream.getvalue()):
+            port.in_waiting = len(stream.getvalue()) - stream.tell()
+            lines, buffer = read_available_lines(port, buffer)
+            update_panel_state(lines, panel, None)
+            sender.update(lines)
+        frames = [call.args[0] for call in factory.return_value.sendto.call_args_list]
+        self.assertEqual(frames, [f"yaw:110.09,{i},-4,-0.031\n".encode() for i in range(200)])
+        self.assertEqual(panel["SYS"], "SYS{sample=196}")
+        self.assertTrue(all(call.args[0] <= 4096 for call in port.read.call_args_list))
+        self.assertFalse(any(row.startswith("PID{") for row in build_panel_lines(panel, 200, 50)))
+        sender.update([])
+        self.assertEqual(factory.return_value.sendto.call_count, 200)
 
-    def test_pending_frame_is_dropped_on_reset_invalid_data_or_expiry(self) -> None:
-        for replacement, now in (
-            (["SYS{ready=1}"], 0.03),
-            (["CTRL{mode=MANUAL}"], 0.03),
-            (self.lines[:-1] + ["IMU{yaw_deg=nan gz_dps=0}"], 0.03),
-            ([], 0.2),
-        ):
-            with self.subTest(replacement=replacement):
-                with patch("ds5_teensy_demo.socket.socket") as factory:
-                    sender = VofaYawSender(1347)
-                sender.update(self.lines, 0.0)
-                sender.update(self.lines, 0.005)
-                sender.update(replacement, now)
-                sender.update([], 1.0)
-                self.assertEqual(factory.return_value.sendto.call_count, 1)
+    def test_serial_budget_bounds_unterminated_input(self) -> None:
+        port = Mock(in_waiting=8192)
+        port.read.return_value = b"x" * 4096
+        lines, buffer = read_available_lines(port, "")
+        self.assertEqual(lines, [])
+        self.assertEqual(len(buffer), 4096)
+        lines, buffer = read_available_lines(port, buffer)
+        self.assertEqual((lines, buffer), ([], ""))
+        port.read.return_value = ("\n" + self.line + "\n").encode()
+        lines, buffer = read_available_lines(port, buffer)
+        self.assertEqual((lines, buffer), ([self.line], ""))
 
-    def test_udp_loopback_receives_firewater_frame(self) -> None:
+    def test_udp_loopback_receives_all_four_samples_per_batch(self) -> None:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as receiver:
             receiver.bind(("127.0.0.1", 0))
             receiver.settimeout(1.0)
             sender = VofaYawSender(receiver.getsockname()[1])
             try:
-                sender.update(self.lines, 0.0)
-                payload, _ = receiver.recvfrom(1024)
-                self.assertEqual(payload, self.frame)
-                self.assertEqual(len(payload.split(b":")[1].split(b",")), 4)
+                for batch in range(50):
+                    lines = [self.line.replace("112.09", str(batch * 4 + i)) for i in range(4)]
+                    sender.update(lines)
+                    for line in lines:
+                        payload, _ = receiver.recvfrom(1024)
+                        self.assertEqual(payload, build_vofa_yaw_frame(line))
+                        self.assertEqual(len(payload.split(b":")[1].split(b",")), 4)
             finally:
                 sender.close()
 
@@ -196,7 +195,7 @@ class VofaTests(unittest.TestCase):
     def test_udp_failure_and_disabled_forwarding_preserve_control_packets(self) -> None:
         for enabled, socket_error in ((False, False), (True, False), (True, True)):
             with self.subTest(enabled=enabled, socket_error=socket_error):
-                options = ["--vofa"] if enabled else []
+                options = ["--send-hz", "200"] + (["--vofa"] if enabled else [])
                 args = build_argument_parser().parse_args(options)
                 reader = Mock()
                 reader.read.return_value = SimpleNamespace(
@@ -206,12 +205,11 @@ class VofaTests(unittest.TestCase):
                 with (
                     patch("ds5_teensy_demo.open_serial_port", return_value=port),
                     patch("ds5_teensy_demo.read_available_lines", side_effect=[
-                        (self.lines, ""), (self.lines, ""), KeyboardInterrupt
+                        ([self.line] * 4, ""), ([self.line] * 4, ""), KeyboardInterrupt
                     ]),
-                    patch("ds5_teensy_demo.time.time", side_effect=[1.0, 1.021, 1.042]),
-                    patch("ds5_teensy_demo.time.monotonic", side_effect=[0.0, 0.021]),
+                    patch("ds5_teensy_demo.time.monotonic", side_effect=[1.0, 1.0051, 1.0102]),
                     patch("ds5_teensy_demo.time.sleep"),
-                    patch("ds5_teensy_demo.render_panel"),
+                    patch("ds5_teensy_demo.render_panel") as render,
                     patch("ds5_teensy_demo.socket.socket") as factory,
                     redirect_stdout(io.StringIO()),
                 ):
@@ -224,8 +222,9 @@ class VofaTests(unittest.TestCase):
                     b"PKT 2 0.100 -0.200 0.300 -0.400 0.500 0.600 8\n",
                 ])
                 port.close.assert_called_once()
+                self.assertEqual(render.call_count, 1)
                 if enabled and not socket_error:
-                    self.assertEqual(factory.return_value.sendto.call_count, 2)
+                    self.assertEqual(factory.return_value.sendto.call_count, 8)
                     factory.return_value.close.assert_called_once()
                 elif socket_error:
                     factory.assert_called_once()

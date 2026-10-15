@@ -53,23 +53,27 @@ uv run python ds5_teensy_demo.py --mode serial --teensy-port COM8 --render-hz 10
 在串口模式增加 `--vofa`，将偏航闭环的四个数值转发到本机 VOFA：
 
 ```powershell
-uv run python ds5_teensy_demo.py --mode serial --teensy-port COM8 --vofa
+uv run python ds5_teensy_demo.py --mode serial --teensy-port COM8 --send-hz 200 --vofa
 ```
 
 VOFA 选择 **UDP**，本地监听地址设为 `127.0.0.1`（或 `0.0.0.0`），监听端口设为 **1347**，协议选择 [FireWater](https://www.vofa.plus/docs/learning/dataengines/firewater/)。VOFA 不要打开 COM8，串口仍由 Controller 独占。
 
 | 通道 | 数值 | 单位 |
 | --- | --- | --- |
-| 0 | 期望 yaw 角：`CTRL.yaw_sp` | deg |
-| 1 | 实际 yaw 角：`IMU.yaw_deg` | deg |
-| 2 | 期望角速度：`CTRL.rate_sp` | deg/s |
-| 3 | 实际角速度：`IMU.gz_dps` | deg/s |
+| 0 | 期望 yaw 角：`PID.yaw_sp` | deg |
+| 1 | 实际 yaw 角：`PID.yaw_deg` | deg |
+| 2 | 期望角速度：`PID.rate_sp` | deg/s |
+| 3 | 实际角速度：`PID.gz_dps` | deg/s |
 
 建议用两个波形图：通道 0、1 放在角度图，通道 2、3 放在角速度图。按 R1 请求自稳，确认 Controller 显示 `mode=STABILIZE` 且 `imu_alive=1` 后才会有曲线；手动模式、掉线或字段无效时停止转发，不补零、不重复旧数据。
 
-转发最多 50Hz，不受 `--render-hz` 影响。更换端口时使用 `--vofa-port 1348`，VOFA 的监听端口也改为同一个值。不加 `--vofa` 时行为不变。
+需要烧录支持独立 `PID{}` 小帧的新版 Teensy 固件。固件每完成一个有效的新偏航样本就输出一条 PID 记录，200Hz IMU 对应约 200 组/秒；Controller 逐条转发，不从 50Hz 面板缓存拼帧，也不把同一批的多个样本合并成一个。旧版仅输出 `CTRL/IMU` 的固件不再提供 VOFA 数据。
 
-本次只转发数据，不接收 VOFA 调参命令，也不支持 Gateway 模式。已运行当前输出 `yaw_sp/rate_sp` 的闭环固件时，无需为这一步重新烧录 Teensy。
+上面的命令将手柄发包设为目标 200Hz；完整遥测和终端面板仍是 50Hz，VOFA 数据接收与面板刷新独立。默认不加 `--send-hz` 仍按 50Hz 发手柄，避免改变其他使用方式。USB/PC 延迟可能造成批量到达或丢帧，实际帧率需实机确认，不能把曲线点数当成精确采样时间。
+
+更换端口时使用 `--vofa-port 1348`，VOFA 的监听端口也改为同一个值。不加 `--vofa` 时不会创建 VOFA socket，原有面板和日志保持原样；`PID{}` 仅用于转发，不新增面板行。
+
+本次只转发数据，不接收 VOFA 调参命令，也不支持 Gateway 模式。固件本地 PID 和 PWM 保持原有约 200Hz，不修改增益、平滑、推力上限或电机方向。
 
 ## Gateway 模式
 

@@ -28,14 +28,13 @@ DEFAULT_RENDER_HZ = 50  # 界面刷新频率
 DEFAULT_SERIAL_OPEN_TIMEOUT_S = 3.0
 DEFAULT_SERIAL_WRITE_TIMEOUT_S = 0.5
 MAX_GATEWAY_DATAGRAMS_PER_LOOP = 32
+MAX_SERIAL_READ_BYTES = 4096  # 限制每轮接收量，避免积压处理拖住手柄发包
 DEFAULT_VOFA_PORT = 1347
-VOFA_SEND_PERIOD_S = 0.02  # 最多 50Hz，不随面板刷新频率变化
-VOFA_FRAME_TIMEOUT_S = 0.1  # 丢弃在电脑上停留过久的待发数据
 VOFA_YAW_FIELDS = (
-    ("CTRL", "yaw_sp"),   # 期望偏航角，单位 deg
-    ("IMU", "yaw_deg"),   # 实际偏航角，单位 deg
-    ("CTRL", "rate_sp"),  # 期望偏航角速度，单位 deg/s
-    ("IMU", "gz_dps"),    # 实际偏航角速度，单位 deg/s
+    "yaw_sp",   # 期望偏航角，单位 deg
+    "yaw_deg",  # 实际偏航角，单位 deg
+    "rate_sp",  # 期望偏航角速度，单位 deg/s
+    "gz_dps",   # 实际偏航角速度，单位 deg/s
 )
 # DISPLAY_TAGS = [
 #     "CTRL",
@@ -132,7 +131,9 @@ def read_available_lines(
     if not serial_port.in_waiting:
         return [], read_buffer
 
-    data = serial_port.read(serial_port.in_waiting).decode("utf-8", errors="replace")
+    data = serial_port.read(min(serial_port.in_waiting, MAX_SERIAL_READ_BYTES)).decode(
+        "utf-8", errors="replace"
+    )
     read_buffer += data
 
     lines: list[str] = []
@@ -142,6 +143,9 @@ def read_available_lines(
         if stripped:
             lines.append(stripped)
 
+    # 固件正常单行小于 1024 字节，超长未结束行不继续占用接收缓存。
+    if len(read_buffer) > MAX_SERIAL_READ_BYTES:
+        read_buffer = ""
     return lines, read_buffer
 
 
@@ -257,17 +261,12 @@ def update_panel_state(
             panel_state["INFO"] = line
 
 
-def build_vofa_yaw_frame(snapshot: dict[str, str]) -> bytes | None:
+def build_vofa_yaw_frame(line: str) -> bytes | None:
+    if not line.startswith("PID{") or not line.endswith("}"):
+        return None
     try:
-        fields = {}
-        for tag in ("CTRL", "SYS", "IMU"):
-            line = snapshot[tag]
-            if not line.startswith(tag + "{") or not line.endswith("}"):
-                return None
-            fields[tag] = dict(token.split("=", 1) for token in line[len(tag) + 1 : -1].split())
-        if fields["CTRL"].get("mode") != "STABILIZE" or fields["SYS"].get("imu_alive") != "1":
-            return None
-        values = [float(fields[tag][key]) for tag, key in VOFA_YAW_FIELDS]
+        fields = dict(token.split("=", 1) for token in line[4:-1].split())
+        values = [float(fields[key]) for key in VOFA_YAW_FIELDS]
     except (KeyError, ValueError):
         return None
     if not all(math.isfinite(value) for value in values):
@@ -280,38 +279,18 @@ class VofaYawSender:
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.socket.setblocking(False)
         self.target = ("127.0.0.1", port)
-        self.snapshot: dict[str, str] = {}
-        self.pending: tuple[float, bytes] | None = None
-        self.last_send = -math.inf
 
-    def update(self, lines: list[str], now: float) -> None:
-        # ponytail: 当前固件快照以 CTRL 开始、IMU 结束，顺序变化时需同步调整。
+    def update(self, lines: list[str]) -> None:
+        # 每个完整 PID 样本转发一次，不按面板频率限速或合并样本。
+        # ponytail: 四通道帧不含时间戳，严格识别 USB 积压时再扩展采样时间。
         for line in lines:
-            tag = extract_tag(line)
-            if tag == "CTRL":
-                self.snapshot = {"CTRL": line}
-                self.pending = None
-            elif line == "SYS{ready=1}":
-                self.snapshot.clear()
-                self.pending = None
-            elif tag in ("SYS", "IMU") and self.snapshot:
-                self.snapshot[tag] = line
-                if tag == "IMU":
-                    frame = build_vofa_yaw_frame(self.snapshot)
-                    self.pending = (now, frame) if frame is not None else None
-                    self.snapshot.clear()
-
-        if self.pending is None or now - self.last_send < VOFA_SEND_PERIOD_S:
-            return
-        received_at, frame = self.pending
-        self.pending = None
-        if now - received_at > VOFA_FRAME_TIMEOUT_S:
-            return
-        self.last_send = now
-        try:
-            self.socket.sendto(frame, self.target)
-        except OSError:
-            pass  # 绘图数据发送失败时丢帧，不重试，不中断手柄控制
+            frame = build_vofa_yaw_frame(line)
+            if frame is None:
+                continue
+            try:
+                self.socket.sendto(frame, self.target)
+            except OSError:
+                pass  # 绘图发送失败只丢当前帧，不重试，不中断手柄控制
 
     def close(self) -> None:
         self.socket.close()
@@ -499,7 +478,7 @@ def run_serial_demo(
         time.sleep(2.0)
 
         while True:
-            now = time.time()
+            now = time.monotonic()
 
             lines, read_buffer = read_available_lines(serial_port, read_buffer)
             update_panel_state(lines, panel_state, log_file)
@@ -521,7 +500,7 @@ def run_serial_demo(
                 last_send = now
 
             if vofa is not None:
-                vofa.update(lines, time.monotonic())
+                vofa.update(lines)
 
             if now - last_render >= 1.0 / args.render_hz:
                 render_panel(
