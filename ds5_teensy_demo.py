@@ -9,6 +9,7 @@ import time
 from typing import TextIO
 
 import serial
+from vision_bridge import VisionBridge
 
 from ds5_reader import (
     DEFAULT_DEADZONE,
@@ -43,6 +44,7 @@ DISPLAY_TAGS = [
     "SYS",
     "DS5",
     "CTRL",
+    "VIS",
     "MIX",
     "PWM",
     "SHT40",
@@ -106,6 +108,13 @@ def build_argument_parser() -> argparse.ArgumentParser:
         "--vofa-command-port", type=int, default=DEFAULT_VOFA_COMMAND_PORT,
         help="Local UDP port receiving VOFA yaw gain commands",
     )
+    parser.add_argument("--vision", action="store_true", help="Enable local click-to-track yaw assistance (serial only)")
+    parser.add_argument("--vision-port", type=int, default=14560)
+    parser.add_argument("--vision-gain", type=float, default=10.)
+    parser.add_argument("--vision-limit", type=float, default=5.)
+    parser.add_argument("--vision-sign", type=int, choices=(-1, 1), default=-1)
+    parser.add_argument("--vision-deadband", type=float, default=.04)
+    parser.add_argument("--vision-exit-deadband", type=float, default=.06)
     return parser
 
 
@@ -501,6 +510,7 @@ def run_serial_demo(
 ) -> int:
     serial_port: serial.Serial | None = None
     vofa: VofaBridge | None = None
+    vision: VisionBridge | None = None
     sequence = 0
     read_buffer: str | None = ""
     last_send = 0.0
@@ -526,6 +536,8 @@ def run_serial_demo(
         )
         print(f"Connecting Teensy on {args.teensy_port}, wait for board ready...")
         time.sleep(2.0)
+        if args.vision:
+            vision = VisionBridge(args)
 
         while True:
             now = time.monotonic()
@@ -535,13 +547,24 @@ def run_serial_demo(
 
             joystick_snapshot = ds5_reader.read()
 
+            if vision is not None:
+                now = time.monotonic()
+                vision.telemetry(lines, now)
+                vision.receive(now, joystick_snapshot.buttons)
+
             if now - last_send >= 1.0 / args.send_hz:
-                sequence += 1
+                sequence = (sequence + 1) & 0xffffffff
+                packet_line = build_packet_line(sequence, joystick_snapshot)
+                if vision is not None:
+                    packet_line += vision.suffix(sequence, now)
                 write_serial_data(
-                    serial_port, (build_packet_line(sequence, joystick_snapshot) + "\n").encode("ascii"),
+                    serial_port, (packet_line + "\n").encode("ascii"),
                     args.teensy_port,
                 )
                 last_send = now
+
+            if vision is not None:
+                vision.reply(now)
 
             if vofa is not None:
                 vofa.update(lines)
@@ -565,13 +588,15 @@ def run_serial_demo(
                 last_render = now
 
             time.sleep(0.001)
-    except (RuntimeError, serial.SerialException) as exc:
+    except (RuntimeError, OSError, serial.SerialException) as exc:
         print(exc)
         return 1
     except KeyboardInterrupt:
         print("\nStop DS5 demo")
         return 0
     finally:
+        if vision is not None:
+            vision.close()
         if vofa is not None:
             vofa.close()
         if serial_port is not None:
@@ -637,6 +662,14 @@ def run_gateway_demo(
 def main() -> int:
     parser = build_argument_parser()
     args = parser.parse_args()
+    if args.vision and (args.mode != "serial" or args.ds5_debug):
+        parser.error("--vision requires serial mode without --ds5-debug")
+    if not 1 <= args.vision_port <= 65535 or (args.vision and args.vofa and args.vision_port in (args.vofa_port, args.vofa_command_port)):
+        parser.error("Invalid/conflicting vision UDP port")
+    if (not all(math.isfinite(v) for v in (args.vision_gain, args.vision_limit, args.vision_deadband, args.vision_exit_deadband))
+            or args.vision_gain <= 0 or not 0 < args.vision_limit <= 5
+            or not 0 <= args.vision_deadband < args.vision_exit_deadband < 1):
+        parser.error("Invalid vision gain, limit (0..5 deg/s) or deadband hysteresis")
     if not 1 <= args.vofa_port <= 65535:
         parser.error("--vofa-port must be between 1 and 65535")
     if not 1 <= args.vofa_command_port <= 65535:

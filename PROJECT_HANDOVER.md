@@ -1,10 +1,28 @@
 # ROV Controller 项目交接
 
-> 最近源码核对：2026-10-15
+> 最近源码核对：2026-10-23
 >
 > 通信基线：串口与 Gateway 模式共用同一套 `PKT`/标签文本
 
 本文只记录当前可用状态，不记录逐次开发流水。行为变化时直接修改对应章节，历史过程以 Git 为准。
+
+## 本地视觉辅助（已接通，网络推流后续适配）
+
+开发分支 `codex/local-visual-yaw`。`--vision`仅支持串口模式，新增 `vision_bridge.py` 负责本机观测与启用仲裁，唯一入口/串口仍为ds5_teensy_demo.py，无新增线程。每轮UDP最多16包、单包8192字节，只保留最新观测；64条已发PKT时间用于检查回执，未建立历史观测队列。
+
+- 接收 `coral.observation.v1`，需有 `selection_monotonic_s`；新鲜VIS证明已自稳后发生的新点击才能启用。启动前、手动模式或接管之前的点击不延后执行。重复帧不得更换源时间、延长有效期。
+- 平滑偏差经比例、死区、限幅生成目标航向变化速度；进入居中0.04、退出0.06，均相对半幅宽度。实际参数见README；不使用XYZ，不再叠加平滑。
+- Circle/Square（bits1/2）及R1（bit10）撤销当前授权；两个旋转键同时按下也撤销。原DS5映射与平移/升降行为不改。
+- 原PKT后追加 `V1 <session> <token> <frame> <age_ms> <state> <slew_dps>`；session为Controller随机非零uint32，token为每次接受新点击递增的uint32，frame为原源帧编号。state为0关闭/1修正/2等待/3居中；只有1可有非零slew。初始先发OFF/token0建立会话。
+- 源有效期最多200ms，并预留20ms串口传输预算（含向上取整的年龄）。同一观测可以按手柄周期重发，但frame不递增、年龄继续增长；不能靠手柄包在线保活视觉。
+- 短暂等待保持授权但停止修正，最长至最后接受检测后0.4秒；恢复需视觉确认。真丢失、过期、取消、模式退出或反馈断链后须重新点击。固件拒绝/故障状态也撤销本地授权。
+- `VIS{session token frame state mode pkt slew}` 为配套固件50Hz独立小帧。只有匹配本Controller会话且echo的PKT发送年龄小于200ms才采用；不会把串口积压的旧遥测当作新鲜模式。确认须匹配本次token和请求状态，slew取固件实际回执。
+- 同一socket向视觉源端口回复 `coral.control.v1`，最多20Hz，含视觉会话/锁定ID、源帧、状态、请求/接受值、结果时间及截止时间。过期UI只显示未确认，不把黄色框当作启用证据。
+- 固件ready或回执超时后建立新OFF会话，旧点击不自动恢复；串口掉线仍退出，不增加自动重连。错误UDP不阻塞手柄发送，停止程序由固件独立超时退出。
+
+验证：新增视觉单元检查与原Controller测试通过，跨项目真实UDP→PKT→编译后的固件模块→回执通过。2026-10-23烧录后COM3/真实IMU无动力13秒验证启用、WAIT恢复、居中、取消、手动接管、断帧、模式重入；收到649份VIS回执。真实USB相机240帧另测收到617份有效控制回执，检测17.90FPS、深度9.21Hz，八路PWM均1500。观测/按键场景由测试脚本生成，真实相机测试也由脚本调用选择入口；没有验证有动力运动、物理手柄操作或水下稳定性。记录在视觉项目 `coral_runs/control_link/`，结束保留MANUAL/LIMIT0。
+
+新增检查文件 `test_vision_bridge.py`；原 `uv run python -m unittest -q` 会一并执行。VOFA继续复用PID曲线与调参，不添加启用按钮；工控机视频不在本次范围。
 
 ## 1. 项目定位
 
@@ -52,7 +70,7 @@ DS5 -> Controller -> UDP/PKT :14550 -> Jetson rov_gateway
 固定面板标签：
 
 ```text
-SYS DS5 CTRL MIX PWM SHT40 PM08 DEPTH IMU PID PARAM
+SYS DS5 CTRL VIS MIX PWM SHT40 PM08 DEPTH IMU PID PARAM
 ```
 
 Gateway 模式额外显示 `GATEWAY`；无标签信息使用 `INFO` 显示。
@@ -271,7 +289,7 @@ uv run python ds5_teensy_demo.py --help
 6. 烧录配套PID小帧固件，加 `--send-hz 200 --vofa`，按 R1 请求自稳；确认实际模式和IMU有效，VOFA四通道与PID字段一致，角度与角速度分别绘图。临时统计一段时间的PID记录和UDP接收数，确认接近200组/秒；不能仅看面板标题判断实际帧率。
 7. 切回 MANUAL 或 IMU 掉线后应停止转发；恢复有效自稳后重新出现曲线。停止 VOFA 不应中断 Controller 手柄控制。
 
-当前18项测试覆盖raw Gateway、IMU排版、缓存日志原样保留、PID四通道、串口坏行与恢复，以及双向UDP、调参白名单/有限非负数、旧上限以上值转发、源端口/数据报预算、PKT优先交错写入、PARAM缓存/重启失效和写超时。混合200个PID样本与50份完整快照及200帧UDP回环仍通过，UDP发送/创建失败不终止手柄发包。unittest、compileall和--help通过；以上是软件检查，不是实机200Hz时序测量，VOFA界面、DS5、Teensy和Gateway仍需实机验证。
+原18项测试覆盖raw Gateway、IMU排版、缓存日志原样保留、PID四通道、串口坏行与恢复，以及双向UDP、调参白名单/有限非负数、旧上限以上值转发、源端口/数据报预算、PKT优先交错写入、PARAM缓存/重启失效和写超时。混合200个PID样本与50份完整快照及200帧UDP回环仍通过，UDP发送/创建失败不终止手柄发包。unittest、compileall和--help通过；以上是软件检查，不是实机200Hz时序测量，VOFA界面、DS5、Teensy和Gateway仍需实机验证。
 
 ## 8. 已知问题与排查
 

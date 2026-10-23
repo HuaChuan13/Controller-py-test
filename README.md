@@ -37,7 +37,7 @@ uv run python ds5_teensy_demo.py --mode serial --teensy-port COM8
 `COM8` 需要按实际 Teensy 端口修改。面板固定显示：
 
 ```text
-SYS{} DS5{} CTRL{} MIX{} PWM{} SHT40{} PM08{} DEPTH{} IMU{} PID{} PARAM{}
+SYS{} DS5{} CTRL{} VIS{} MIX{} PWM{} SHT40{} PM08{} DEPTH{} IMU{} PID{} PARAM{}
 ```
 
 只有IMU在显示端拆成温度、加速度（ACC）、角速度（GYR）、角度（ANG）四行，三轴数值使用固定列宽；其余标签保持原始文本。ACC/GYR/ANG不是新增回传标签，原始日志和50Hz频率不变，无需重新烧录Teensy。
@@ -47,6 +47,24 @@ SYS{} DS5{} CTRL{} MIX{} PWM{} SHT40{} PM08{} DEPTH{} IMU{} PID{} PARAM{}
 ```powershell
 uv run python ds5_teensy_demo.py --mode serial --teensy-port COM8 --render-hz 10
 ```
+
+### 本地相机视觉 yaw 辅助
+
+配套视觉项目与Teensy固件位于各自 `codex/local-visual-yaw` 分支。Controller仍独占串口，增加 `--vision` 即接收本机珊瑚观测；工控机视频后续适配：
+
+```powershell
+uv run python ds5_teensy_demo.py --mode serial --teensy-port COM3 --vision --vofa
+```
+
+COM3为本次实测端口，按实际枚举修改；`--vofa`可选。另一个终端在视觉目录运行 `uv run --locked python run.py --camera 0 --device cpu --confidence 0.5`。
+
+按R1进入自稳并释放旋转键后，再点击珊瑚启用辅助。右键/C取消；方框/圆圈键接管yaw，松开后需重新点击。手动模式点击只观察，之后切入自稳不会自动启用。短暂WAITING暂停修正，确认恢复后可继续；真丢失、超时、重连或切模式后须新点击。VOFA无需视觉启用按钮，继续用于曲线与调参。
+
+实际视觉控制参数：`--vision-gain 10 --vision-limit 5 --vision-sign -1 --vision-deadband 0.04 --vision-exit-deadband 0.06`；分别为偏差比例系数、目标航向变化速度上限(°/s)、方向、进入/退出居中阈值(半幅宽度归一化)。固件独立限制5°/s和5°领先量，不能借此直接给角速度内环设值。视觉项目的 `--yaw-*` 仅为候选预览，不改变Controller实际参数。
+
+`--vision-port`默认14560，只监听127.0.0.1。视觉窗口显示真实回执 `CONTROL ACTIVE/CENTERED/WAITING`，无新鲜回执不显示已确认。`VIS{}`进入Controller固定面板。不能与gateway或DS5调试模式组合；不加 `--vision` 时仍发送原PKT。
+
+本次已完成软件联调与COM3无动力验证，**结束时保持MANUAL、推力上限0**；实际带动力方向与水下稳定性仍待验证。详细协议和验证边界见PROJECT_HANDOVER.md。
 
 ### VOFA 偏航曲线
 
