@@ -48,12 +48,16 @@ class VisionBridge:
         self.vision_session = None
         self.request_state, self.slew = 0, 0.
         self.last_reply = 0.
+        self.sent_slew, self.sent_at = None, 0.
 
     def stop(self, reason, now):
         self.active = False
         self.centered = False
         self.request_state, self.slew = 0, 0.
-        self.barrier = now
+        # Producer events are already ordered by observation_seq/lock_id. On Windows,
+        # cancel and re-click can share a clock tick; only local faults need a time barrier.
+        if reason not in ("CANCELLED", "TARGET_LOST", "NEW_VISION_SESSION"):
+            self.barrier = max(self.barrier, now)
         self.state = reason
 
     def telemetry(self, lines, now):
@@ -69,6 +73,8 @@ class VisionBridge:
                 fields = dict(item.split("=", 1) for item in line[4:-1].split())
                 ack = {key: integer(int(fields[key])) for key in ("session", "token", "frame", "state", "mode", "pkt")}
                 ack["slew"] = number(float(fields["slew"]), -5, 5)
+                for key, low, high in (("yaw_sp", -180, 180), ("yaw_deg", -180, 180), ("lead_limit", .1, 180)):
+                    ack[key] = number(float(fields[key]), low, high) if key in fields else None
                 if ack["session"] != self.session or ack["state"] > 6 or ack["mode"] > 1:
                     continue
                 sent_at = next((stamp for seq, stamp in reversed(self.sent) if seq == ack["pkt"]), None)
@@ -82,6 +88,8 @@ class VisionBridge:
                 self.stop("OBSERVE_ONLY", now)
             elif self.ready_since is None:
                 self.ready_since = now
+                if not self.active and self.state in ("OBSERVE_ONLY", "WAIT_LINK", "NEW_VISION_SESSION"):
+                    self.state = "CLICK_AGAIN"
             if self.active and ack["token"] == self.token and ack["state"] in (0, 4, 5, 6):
                 self.stop({0: "CLICK_AGAIN", 4: "MANUAL_OVERRIDE", 5: "EXPIRED", 6: "MODE_REJECTED"}[ack["state"]], now)
 
@@ -107,6 +115,8 @@ class VisionBridge:
                 break
             if source[0] != "127.0.0.1" or len(data) > 8192:
                 continue
+            # The datagram may have been produced after this loop's original timestamp.
+            now = max(now, time.monotonic())
             try:
                 self.observe(json.loads(data), source, now)
             except (ValueError, KeyError, TypeError, UnicodeDecodeError, OverflowError):
@@ -132,6 +142,8 @@ class VisionBridge:
         if p["valid"] != (p["status"] == "tracking"):
             raise ValueError("valid/state mismatch")
         if self.packet and session == self.vision_session:
+            if lock < self.packet["lock_id"]:
+                return
             if frame < self.packet["capture_seq"]:
                 return
             if frame == self.packet["capture_seq"] and stamp != self.packet["capture_monotonic_s"]:
@@ -143,8 +155,9 @@ class VisionBridge:
         selection = p.get("selection_monotonic_s")
         if selection is not None:
             number(selection, 0, result)
-        if session != self.vision_session:
-            self.stop("NEW_VISION_SESSION", now)
+        new_session = session != self.vision_session
+        if new_session:
+            self.stop("NEW_VISION_SESSION", result)
             # New session is allowed only through a subsequent fresh click, never its cached selection.
         self.vision_session, self.last_observation, self.last_result = session, seq, result
         self.packet, self.source = p, source
@@ -153,7 +166,7 @@ class VisionBridge:
         if key != self.seen_selection:
             self.seen_selection = key
             self.active = False
-            if (p["valid"] and selection is not None and self.ready_since is not None
+            if (not new_session and p["valid"] and selection is not None and self.ready_since is not None
                     and self.barrier < selection <= now and self.ready_since <= selection
                     and now - selection < .2 and now < p["deadline"]):
                 if self.token == 0xffffffff:
@@ -164,8 +177,9 @@ class VisionBridge:
                 self.state = "AWAITING_TEENSY"
             else:
                 self.state = "CLICK_AGAIN" if self.ready_since is not None else "OBSERVE_ONLY"
-        if p["status"] not in ("tracking", "waiting"):
-            self.stop("CLICK_AGAIN", now)
+        if p["status"] == "cancelled" or self.active and p["status"] not in ("tracking", "waiting"):
+            # A queued cancellation must not invalidate a click made later at the producer.
+            self.stop("CANCELLED" if p["status"] == "cancelled" else "TARGET_LOST", result)
         if p["status"] == "waiting":
             last_seen = number(p["track_memory"]["last_seen_monotonic_s"], 0, stamp)
             remaining = number(p["track_memory"]["remaining_ms"], 0, 10000) / 1000
@@ -201,6 +215,7 @@ class VisionBridge:
         age = max(0, 200 - remaining) if self.active else 0
         frame = self.packet["capture_seq"] if self.active else 0
         self.sent.append((sequence, now))
+        self.sent_slew, self.sent_at = self.slew, now
         return f" V1 {self.session} {self.token} {frame} {age} {self.request_state} {self.slew:.4f}"
 
     def reply(self, now):
@@ -208,13 +223,20 @@ class VisionBridge:
             return
         self.last_reply = now
         ack = self.ack
+        fresh = ack is not None and now < self.ack_until
         confirmed = bool(self.active and ack and now < self.ack_until and ack["token"] == self.token
                          and ack["state"] == self.request_state and ack["frame"] <= self.packet["capture_seq"])
         status = {1: "ACTIVE", 2: "WAITING", 3: "CENTERED"}.get(self.request_state) if confirmed else self.state
         result = dict(schema="coral.control.v1", session=self.packet["session"], lock_id=self.packet["lock_id"],
                       capture_seq=self.packet["capture_seq"], status=status, confirmed=confirmed,
-                      requested_slew_dps=self.slew if self.active else None,
-                      accepted_slew_dps=ack["slew"] if confirmed else None,
+                      requested_slew_dps=self.sent_slew if 0 <= now - self.sent_at < .2 else None,
+                      accepted_slew_dps=ack["slew"] if confirmed else
+                          (0. if fresh and not self.active and ack["token"] == self.token
+                           and ack["state"] in (0, 4, 5, 6) and ack["slew"] == 0 else None),
+                      mode=("STABILIZE" if ack["mode"] == 1 else "MANUAL") if fresh else None,
+                      yaw_target_deg=ack.get("yaw_sp") if fresh and ack["mode"] == 1 else None,
+                      yaw_actual_deg=ack.get("yaw_deg") if fresh else None,
+                      lead_limit_deg=ack.get("lead_limit") if fresh else None,
                       result_monotonic_s=now, valid_until_monotonic_s=min(now + .2, self.ack_until) if confirmed else now + .2)
         try:
             self.socket.sendto(json.dumps(result, allow_nan=False).encode(), self.source)

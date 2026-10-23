@@ -551,6 +551,7 @@ def run_serial_demo(
                 now = time.monotonic()
                 vision.telemetry(lines, now)
                 vision.receive(now, joystick_snapshot.buttons)
+                now = time.monotonic()
 
             if now - last_send >= 1.0 / args.send_hz:
                 sequence = (sequence + 1) & 0xffffffff

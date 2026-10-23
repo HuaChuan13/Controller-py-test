@@ -332,6 +332,32 @@ class VofaTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "Serial write to COM8 timed out"):
             write_serial_data(port, b"CMD PID YAW RATE_KP 0.03\n", "COM8")
 
+    def test_real_vofa_udp_commands_and_curves_with_vision_enabled(self) -> None:
+        from vision_bridge import VisionBridge
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as peer:
+            peer.bind(("127.0.0.1", 0))
+            peer.settimeout(1)
+            args = build_argument_parser().parse_args(["--vision", "--vision-port", "0", "--vofa"])
+            vofa = VofaBridge(peer.getsockname()[1], command_port=0)
+            vision = VisionBridge(args)
+            self.addCleanup(vofa.close)
+            self.addCleanup(vision.close)
+            peer.sendto(b"CMD PID YAW RATE_KP 0.03\n", vofa.socket.getsockname())
+            reader, port = Mock(), Mock()
+            reader.read.return_value = SimpleNamespace(lx=0,ly=0,rx=0,ry=0,l2=0,r2=0,buttons=0)
+            param = "PARAM{status=OK angle_kp=2 rate_kp=0.03 rate_ki=0 rate_kd=0}"
+            with (patch("ds5_teensy_demo.open_serial_port", return_value=port),
+                  patch("ds5_teensy_demo.VofaBridge", return_value=vofa),
+                  patch("ds5_teensy_demo.VisionBridge", return_value=vision),
+                  patch("ds5_teensy_demo.read_available_lines", side_effect=[([self.line,param],""), KeyboardInterrupt]),
+                  patch("ds5_teensy_demo.time.sleep"), patch("ds5_teensy_demo.render_panel"), redirect_stdout(io.StringIO())):
+                self.assertEqual(run_serial_demo(args, reader, None), 0)
+            sent = [call.args[0] for call in port.write.call_args_list]
+            self.assertIn(b" V1 ", sent[0])
+            self.assertEqual(sent[1], b"CMD PID YAW RATE_KP 0.03\n")
+            self.assertEqual(peer.recv(1024), self.frame)
+            self.assertEqual(peer.recv(1024), (param+"\n").encode())
+
     def test_cli_defaults_and_invalid_options_before_hardware_access(self) -> None:
         args = build_argument_parser().parse_args([])
         self.assertFalse(args.vofa)

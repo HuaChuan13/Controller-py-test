@@ -24,6 +24,9 @@ def acknowledge(bridge, now, seq, state=0, mode=1, token=None, frame=0):
 
 class VisionTests(unittest.TestCase):
     def setUp(self):
+        clock_patch = patch("vision_bridge.time.monotonic", return_value=10.)
+        self.clock = clock_patch.start()
+        self.addCleanup(clock_patch.stop)
         args = build_argument_parser().parse_args(["--vision", "--vision-port", "0"])
         with patch("vision_bridge.time.monotonic", return_value=10.):
             self.b = VisionBridge(args)
@@ -63,6 +66,12 @@ class VisionTests(unittest.TestCase):
         self.assertEqual((self.b.token, self.b.request_state), (1, 1))
         self.b.observe(observation(10.13, frame=4, status="cancelled", selection=None), self.source, 10.13)
         self.assertFalse(self.b.active)
+        self.b.suffix(3, 10.14)
+        self.b.telemetry([f"VIS{{session={self.b.session} token={self.b.token} frame=3 state=0 mode=1 pkt=3 slew=0 yaw_sp=12 yaw_deg=12 lead_limit=15}}"], 10.15)
+        self.b.reply(10.16)
+        stopped = json.loads(self.sender.recv(4096))
+        self.assertEqual((stopped["requested_slew_dps"], stopped["accepted_slew_dps"]), (0, 0))
+        self.assertEqual(stopped["lead_limit_deg"], 15)
 
     def test_manual_rejects_cached_selection_but_new_click_works(self):
         self.start()
@@ -122,6 +131,32 @@ class VisionTests(unittest.TestCase):
         self.assertTrue(self.b.suffix(4, 10.09).endswith("0 0 0 0 0.0000"))
         acknowledge(self.b, 10.4, 4, mode=1)
         self.assertIsNone(self.b.ready_since)
+
+    def test_queued_idle_or_cancel_does_not_block_a_later_click(self):
+        self.b.observe(observation(10.025, lock=0, frame=1, status="idle", selection=None), self.source, 10.04)
+        self.b.observe(observation(10.035, frame=2, selection=10.03), self.source, 10.04)
+        self.assertTrue(self.b.active, "idle and click in same receive batch")
+        self.b.observe(observation(10.05, frame=3, status="cancelled", selection=None), self.source, 10.07)
+        self.b.observe(observation(10.065, lock=2, frame=4, selection=10.06), self.source, 10.07)
+        self.assertTrue(self.b.active, "cancel and new click in same receive batch")
+        self.b.observe(observation(10.08, lock=2, frame=5, status="cancelled", selection=None), self.source, 10.09)
+        self.b.observe(observation(10.08, lock=3, frame=6, selection=10.08), self.source, 10.09)
+        self.assertTrue(self.b.active, "same clock tick must use producer ordering")
+        self.b.stop("EXPIRED", 10.1)
+        self.b.observe(observation(10.1, lock=4, frame=7, selection=10.1), self.source, 10.11)
+        self.assertFalse(self.b.active, "local fault barrier must remain strict")
+
+    def test_datagram_created_during_receive_is_not_future_data(self):
+        self.clock.return_value = 10.045
+        self.sender.sendto(json.dumps(observation(10.044)).encode(), self.b.socket.getsockname())
+        self.b.receive(10.04, 0)
+        self.assertTrue(self.b.active)
+
+    def test_failure_reason_survives_later_idle_observations(self):
+        self.start()
+        self.b.stop("EXPIRED", 10.1)
+        self.b.observe(observation(10.12, frame=2, status="stale", selection=None), self.source, 10.12)
+        self.assertEqual(self.b.state, "EXPIRED")
 
 
 if __name__ == "__main__":
