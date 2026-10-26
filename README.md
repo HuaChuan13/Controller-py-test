@@ -2,6 +2,8 @@
 
 ROV 的 Python 调试上位机，用于读取 DualSense 手柄、发送控制数据并查看下位机回显。正式产品上位机位于 C# 项目，本仓库只保留链路联调所需功能。
 
+网络视觉配套分支为 `codex/network-video`：Jetson 视频由 PC 视觉项目接收，本程序仍通过 `--teensy-port COM3 --vision --vofa` 使用原 USB 控制链路。发送节拍使用高精度时钟，避免 Windows 的15.625ms粗时钟把目标50Hz降低到约32Hz；实际发送速率仍受CPU/串口负载影响。VOFA曲线与手动PID调参保持原有接口，Teensy固件无需为视频接入重新烧录。
+
 当前支持两条链路：
 
 ```text

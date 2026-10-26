@@ -553,7 +553,10 @@ def run_serial_demo(
                 vision.receive(now, joystick_snapshot.buttons)
                 now = time.monotonic()
 
-            if now - last_send >= 1.0 / args.send_hz:
+            # Windows/Python 3.11 monotonic() has 15.625ms ticks: a 20ms
+            # period otherwise becomes ~31ms. Keep protocol ages on monotonic.
+            schedule_now = time.perf_counter()
+            if schedule_now - last_send >= 1.0 / args.send_hz:
                 sequence = (sequence + 1) & 0xffffffff
                 packet_line = build_packet_line(sequence, joystick_snapshot)
                 if vision is not None:
@@ -562,7 +565,7 @@ def run_serial_demo(
                     serial_port, (packet_line + "\n").encode("ascii"),
                     args.teensy_port,
                 )
-                last_send = now
+                last_send = schedule_now
 
             if vision is not None:
                 vision.reply(now)
@@ -577,7 +580,7 @@ def run_serial_demo(
                     if command is not None:
                         write_serial_data(serial_port, command, args.teensy_port)
 
-            if now - last_render >= 1.0 / args.render_hz:
+            if schedule_now - last_render >= 1.0 / args.render_hz:
                 render_panel(
                     build_panel_lines(
                         panel_state,
@@ -586,7 +589,7 @@ def run_serial_demo(
                         title="DS5 -> Teensy demo",
                     )
                 )
-                last_render = now
+                last_render = schedule_now
 
             time.sleep(0.001)
     except (RuntimeError, OSError, serial.SerialException) as exc:
@@ -627,7 +630,7 @@ def run_gateway_demo(
             udp_socket.setblocking(False)
 
             while True:
-                now = time.time()
+                now = time.perf_counter()
 
                 lines = read_available_gateway_lines(udp_socket)
                 update_panel_state(lines, panel_state, log_file)

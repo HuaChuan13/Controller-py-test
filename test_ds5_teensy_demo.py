@@ -310,6 +310,7 @@ class VofaTests(unittest.TestCase):
             patch("ds5_teensy_demo.open_serial_port", return_value=port),
             patch("ds5_teensy_demo.read_available_lines", side_effect=[([], "")] * 3 + [KeyboardInterrupt]),
             patch("ds5_teensy_demo.time.monotonic", side_effect=[1.0, 1.0051, 1.0211, 1.03]),
+            patch("ds5_teensy_demo.time.perf_counter", side_effect=[1.0, 1.0051, 1.0211]),
             patch("ds5_teensy_demo.time.sleep"),
             patch("ds5_teensy_demo.render_panel") as render,
             patch("ds5_teensy_demo.socket.socket") as factory,
@@ -395,6 +396,7 @@ class VofaTests(unittest.TestCase):
                         ([self.line] * 4, ""), ([self.line] * 4, ""), KeyboardInterrupt
                     ]),
                     patch("ds5_teensy_demo.time.monotonic", side_effect=[1.0, 1.0051, 1.0102]),
+                    patch("ds5_teensy_demo.time.perf_counter", side_effect=[1.0, 1.0051]),
                     patch("ds5_teensy_demo.time.sleep"),
                     patch("ds5_teensy_demo.render_panel") as render,
                     patch("ds5_teensy_demo.socket.socket") as factory,
@@ -419,6 +421,22 @@ class VofaTests(unittest.TestCase):
                     factory.return_value.sendto.assert_not_called()
                 else:
                     factory.assert_not_called()
+
+
+class SendClockTests(unittest.TestCase):
+    def test_coarse_protocol_clock_does_not_reduce_50hz_send_rate(self):
+        args = build_argument_parser().parse_args([])
+        reader, port = Mock(), Mock()
+        reader.read.return_value = SimpleNamespace(lx=0,ly=0,rx=0,ry=0,l2=0,r2=0,buttons=0)
+        with (patch("ds5_teensy_demo.open_serial_port", return_value=port),
+              patch("ds5_teensy_demo.read_available_lines", side_effect=[([], "")] * 4 + [KeyboardInterrupt]),
+              patch("ds5_teensy_demo.time.monotonic", side_effect=[1.,1.015625,1.03125,1.046875,1.0625]),
+              patch("ds5_teensy_demo.time.perf_counter", side_effect=[1.,1.0201,1.0402,1.0603]),
+              patch("ds5_teensy_demo.time.sleep"), patch("ds5_teensy_demo.render_panel"),
+              redirect_stdout(io.StringIO())):
+            self.assertEqual(run_serial_demo(args, reader, None), 0)
+        self.assertEqual(port.write.call_count, 4)
+        port.close.assert_called_once()
 
 
 if __name__ == "__main__":
