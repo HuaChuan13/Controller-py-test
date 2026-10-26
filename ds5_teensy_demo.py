@@ -9,6 +9,7 @@ import time
 from typing import TextIO
 
 import serial
+from vision_bridge import VisionBridge
 
 from ds5_reader import (
     DEFAULT_DEADZONE,
@@ -28,27 +29,30 @@ DEFAULT_RENDER_HZ = 50  # 界面刷新频率
 DEFAULT_SERIAL_OPEN_TIMEOUT_S = 3.0
 DEFAULT_SERIAL_WRITE_TIMEOUT_S = 0.5
 MAX_GATEWAY_DATAGRAMS_PER_LOOP = 32
-# DISPLAY_TAGS = [
-#     "CTRL",
-#     "SYS",
-#     "DS5",
-#     "MIX",
-#     "PWM",
-#     "SHT40",
-#     "PM08",
-#     "DEPTH",
-#     "IMU",
-# ]
+MAX_SERIAL_READ_BYTES = 4096  # 限制每轮接收量，避免积压处理拖住手柄发包
+DEFAULT_VOFA_PORT = 1347
+DEFAULT_VOFA_COMMAND_PORT = 1346
+MAX_VOFA_COMMAND_BYTES = 128
+VOFA_YAW_GAINS = ("ANGLE_KP", "RATE_KP", "RATE_KI", "RATE_KD")
+VOFA_YAW_FIELDS = (
+    "yaw_sp",   # 期望偏航角，单位 deg
+    "yaw_deg",  # 实际偏航角，单位 deg
+    "rate_sp",  # 期望偏航角速度，单位 deg/s
+    "gz_dps",   # 实际偏航角速度，单位 deg/s
+)
 DISPLAY_TAGS = [
     "SYS",
     "DS5",
     "CTRL",
+    "VIS",
     "MIX",
     "PWM",
     "SHT40",
     "PM08",
     "DEPTH",
     "IMU",
+    "PID",
+    "PARAM",
 ]
 IMU_ROWS = (
     ("IMU", ("temp_c",), 2),
@@ -92,6 +96,25 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="Only show raw DS5 axes/buttons/hats and packed snapshot; no serial",
     )
     parser.add_argument("--log-file", default="")
+    parser.add_argument(
+        "--vofa",
+        action="store_true",
+        help="Bridge yaw telemetry and manual gain commands with local VOFA (serial mode only)",
+    )
+    parser.add_argument(
+        "--vofa-port", type=int, default=DEFAULT_VOFA_PORT, help="VOFA UDP listening port"
+    )
+    parser.add_argument(
+        "--vofa-command-port", type=int, default=DEFAULT_VOFA_COMMAND_PORT,
+        help="Local UDP port receiving VOFA yaw gain commands",
+    )
+    parser.add_argument("--vision", action="store_true", help="Enable local click-to-track yaw assistance (serial only)")
+    parser.add_argument("--vision-port", type=int, default=14560)
+    parser.add_argument("--vision-gain", type=float, default=10.)
+    parser.add_argument("--vision-limit", type=float, default=5.)
+    parser.add_argument("--vision-sign", type=int, choices=(-1, 1), default=-1)
+    parser.add_argument("--vision-deadband", type=float, default=.04)
+    parser.add_argument("--vision-exit-deadband", type=float, default=.06)
     return parser
 
 
@@ -110,21 +133,34 @@ def build_packet_line(sequence: int, joystick: JoystickSnapshot) -> str:
 
 
 def read_available_lines(
-    serial_port: serial.Serial, read_buffer: str
-) -> tuple[list[str], str]:
+    serial_port: serial.Serial, read_buffer: str | None
+) -> tuple[list[str], str | None]:
     if not serial_port.in_waiting:
         return [], read_buffer
 
-    data = serial_port.read(serial_port.in_waiting).decode("utf-8", errors="replace")
+    data = serial_port.read(min(serial_port.in_waiting, MAX_SERIAL_READ_BYTES)).decode(
+        "utf-8", errors="replace"
+    )
+    # None 表示超长行尚未结束，必须丢弃到换行后才能重新接收。
+    if read_buffer is None:
+        _, newline, data = data.partition("\n")
+        if not newline:
+            return [], None
+        read_buffer = ""
     read_buffer += data
 
     lines: list[str] = []
     while "\n" in read_buffer:
         line, read_buffer = read_buffer.split("\n", 1)
+        if len(line) > MAX_SERIAL_READ_BYTES:
+            continue
         stripped = line.strip()
         if stripped:
             lines.append(stripped)
 
+    # 固件为 ASCII；正常单行小于 1024 字节，超长后不再保留正文。
+    if len(read_buffer) > MAX_SERIAL_READ_BYTES:
+        read_buffer = None
     return lines, read_buffer
 
 
@@ -228,6 +264,8 @@ def update_panel_state(
     lines: list[str], panel_state: dict[str, str], log_file: TextIO | None
 ) -> None:
     for line in lines:
+        if line == "SYS{ready=1}":
+            panel_state.pop("PARAM", None)  # 固件重启恢复默认值，不能沿用旧参数确认
         text = f"[Teensy] {line}"
         if log_file is not None:
             log_file.write(text + "\n")
@@ -238,6 +276,83 @@ def update_panel_state(
             panel_state[tag] = line
         else:
             panel_state["INFO"] = line
+
+
+def build_vofa_yaw_frame(line: str) -> bytes | None:
+    if not line.startswith("PID{") or not line.endswith("}"):
+        return None
+    try:
+        fields = dict(token.split("=", 1) for token in line[4:-1].split())
+        values = [float(fields[key]) for key in VOFA_YAW_FIELDS]
+    except (KeyError, ValueError):
+        return None
+    if not all(math.isfinite(value) for value in values):
+        return None
+    return ("yaw:" + ",".join(f"{value:.9g}" for value in values) + "\n").encode("ascii")
+
+
+def normalize_vofa_command(data: bytes) -> bytes:
+    if not data or len(data) > MAX_VOFA_COMMAND_BYTES:
+        raise ValueError("command must contain 1..128 bytes")
+    text = data.decode("ascii").strip()
+    fields = text.split()
+    if "\n" in text or "\r" in text or len(fields) != 5 or fields[:3] != ["CMD", "PID", "YAW"]:
+        raise ValueError("expected one CMD PID YAW <gain> <value> line")
+    gain = fields[3]
+    value = float(fields[4])
+    # 可调上限只由 Teensy Config.h 维护，避免 PC 与固件范围不一致。
+    if gain not in VOFA_YAW_GAINS or not math.isfinite(value) or value < 0:
+        raise ValueError("unknown yaw gain or value is not finite and nonnegative")
+    return f"CMD PID YAW {gain} {value:.9g}\n".encode("ascii")
+
+
+class VofaBridge:
+    def __init__(self, port: int, command_port: int = DEFAULT_VOFA_COMMAND_PORT) -> None:
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            self.socket.bind(("127.0.0.1", command_port))
+            self.socket.setblocking(False)
+        except OSError:
+            self.socket.close()
+            raise
+        self.target = ("127.0.0.1", port)
+
+    def read_command(self) -> bytes | None:
+        # 每轮只读一个数据报；只接收已配置的本机 VOFA 端口，不开放任意命令透传。
+        try:
+            data, source = self.socket.recvfrom(MAX_VOFA_COMMAND_BYTES + 1)
+        except BlockingIOError:
+            return None
+        if source != self.target:
+            return None
+        return normalize_vofa_command(data)
+
+    def update(self, lines: list[str]) -> None:
+        # 每个完整 PID 样本转发一次，不按面板频率限速或合并样本。
+        # ponytail: 四通道帧不含时间戳，严格识别 USB 积压时再扩展采样时间。
+        for line in lines:
+            frame = build_vofa_yaw_frame(line)
+            if line.startswith("PARAM{") and line.endswith("}"):
+                try:
+                    frame = (line + "\n").encode("ascii")
+                except UnicodeEncodeError:
+                    continue
+            if frame is None:
+                continue
+            try:
+                self.socket.sendto(frame, self.target)
+            except OSError:
+                pass  # 绘图发送失败只丢当前帧，不重试，不中断手柄控制
+
+    def close(self) -> None:
+        self.socket.close()
+
+
+def write_serial_data(serial_port: serial.Serial, data: bytes, port_name: str) -> None:
+    try:
+        serial_port.write(data)
+    except serial.SerialTimeoutException as exc:
+        raise RuntimeError(f"Serial write to {port_name} timed out") from exc
 
 
 def format_imu_lines(line: str) -> list[str]:
@@ -394,13 +509,20 @@ def run_serial_demo(
     log_file: TextIO | None,
 ) -> int:
     serial_port: serial.Serial | None = None
+    vofa: VofaBridge | None = None
+    vision: VisionBridge | None = None
     sequence = 0
-    read_buffer = ""
+    read_buffer: str | None = ""
     last_send = 0.0
     last_render = 0.0
     panel_state: dict[str, str] = {}
 
     try:
+        if args.vofa:
+            try:
+                vofa = VofaBridge(args.vofa_port, args.vofa_command_port)
+            except OSError as exc:
+                panel_state["INFO"] = f"INFO{{vofa=disabled error={exc}}}"
         joystick_name = ds5_reader.open()
         print(f"Joystick: {joystick_name}")
 
@@ -414,30 +536,51 @@ def run_serial_demo(
         )
         print(f"Connecting Teensy on {args.teensy_port}, wait for board ready...")
         time.sleep(2.0)
+        if args.vision:
+            vision = VisionBridge(args)
 
         while True:
-            now = time.time()
+            now = time.monotonic()
 
             lines, read_buffer = read_available_lines(serial_port, read_buffer)
             update_panel_state(lines, panel_state, log_file)
 
             joystick_snapshot = ds5_reader.read()
 
-            if now - last_send >= 1.0 / args.send_hz:
-                sequence += 1
-                try:
-                    serial_port.write(
-                        (build_packet_line(sequence, joystick_snapshot) + "\n").encode(
-                            "utf-8"
-                        )
-                    )
-                except serial.SerialTimeoutException as exc:
-                    raise RuntimeError(
-                        f"Serial write to {args.teensy_port} timed out"
-                    ) from exc
-                last_send = now
+            if vision is not None:
+                now = time.monotonic()
+                vision.telemetry(lines, now)
+                vision.receive(now, joystick_snapshot.buttons)
+                now = time.monotonic()
 
-            if now - last_render >= 1.0 / args.render_hz:
+            # Windows/Python 3.11 monotonic() has 15.625ms ticks: a 20ms
+            # period otherwise becomes ~31ms. Keep protocol ages on monotonic.
+            schedule_now = time.perf_counter()
+            if schedule_now - last_send >= 1.0 / args.send_hz:
+                sequence = (sequence + 1) & 0xffffffff
+                packet_line = build_packet_line(sequence, joystick_snapshot)
+                if vision is not None:
+                    packet_line += vision.suffix(sequence, now)
+                write_serial_data(
+                    serial_port, (packet_line + "\n").encode("ascii"),
+                    args.teensy_port,
+                )
+                last_send = schedule_now
+
+            if vision is not None:
+                vision.reply(now)
+
+            if vofa is not None:
+                vofa.update(lines)
+                try:
+                    command = vofa.read_command()
+                except (ValueError, OSError) as exc:
+                    panel_state["INFO"] = f"INFO{{vofa_command=rejected error={exc}}}"
+                else:
+                    if command is not None:
+                        write_serial_data(serial_port, command, args.teensy_port)
+
+            if schedule_now - last_render >= 1.0 / args.render_hz:
                 render_panel(
                     build_panel_lines(
                         panel_state,
@@ -446,16 +589,20 @@ def run_serial_demo(
                         title="DS5 -> Teensy demo",
                     )
                 )
-                last_render = now
+                last_render = schedule_now
 
             time.sleep(0.001)
-    except (RuntimeError, serial.SerialException) as exc:
+    except (RuntimeError, OSError, serial.SerialException) as exc:
         print(exc)
         return 1
     except KeyboardInterrupt:
         print("\nStop DS5 demo")
         return 0
     finally:
+        if vision is not None:
+            vision.close()
+        if vofa is not None:
+            vofa.close()
         if serial_port is not None:
             serial_port.close()
 
@@ -483,7 +630,7 @@ def run_gateway_demo(
             udp_socket.setblocking(False)
 
             while True:
-                now = time.time()
+                now = time.perf_counter()
 
                 lines = read_available_gateway_lines(udp_socket)
                 update_panel_state(lines, panel_state, log_file)
@@ -517,7 +664,24 @@ def run_gateway_demo(
 
 
 def main() -> int:
-    args = build_argument_parser().parse_args()
+    parser = build_argument_parser()
+    args = parser.parse_args()
+    if args.vision and (args.mode != "serial" or args.ds5_debug):
+        parser.error("--vision requires serial mode without --ds5-debug")
+    if not 1 <= args.vision_port <= 65535 or (args.vision and args.vofa and args.vision_port in (args.vofa_port, args.vofa_command_port)):
+        parser.error("Invalid/conflicting vision UDP port")
+    if (not all(math.isfinite(v) for v in (args.vision_gain, args.vision_limit, args.vision_deadband, args.vision_exit_deadband))
+            or args.vision_gain <= 0 or not 0 < args.vision_limit <= 5
+            or not 0 <= args.vision_deadband < args.vision_exit_deadband < 1):
+        parser.error("Invalid vision gain, limit (0..5 deg/s) or deadband hysteresis")
+    if not 1 <= args.vofa_port <= 65535:
+        parser.error("--vofa-port must be between 1 and 65535")
+    if not 1 <= args.vofa_command_port <= 65535:
+        parser.error("--vofa-command-port must be between 1 and 65535")
+    if args.vofa and args.vofa_command_port == args.vofa_port:
+        parser.error("VOFA receive and command ports must differ")
+    if args.vofa and (args.mode != "serial" or args.ds5_debug):
+        parser.error("--vofa requires serial mode without --ds5-debug")
 
     if args.sdl_joystick_device:
         os.environ["SDL_JOYSTICK_DEVICE"] = args.sdl_joystick_device
